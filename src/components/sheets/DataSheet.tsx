@@ -1,0 +1,518 @@
+// src/components/sheets/DataSheet.tsx
+// 計測値の表示・平滑化フィルタ・CSV 書き出し。
+//
+// 計算内容は Ver.2 の DataPanel と同一（中心差分による速度、
+// Butterworth 零位相 / Savitzky-Golay の平滑化）。
+// 変更点は表示レイアウトと、スマホからのファイル取り出し手段。
+// iOS では <a download> がファイルアプリに入らないことがあるので、
+// Web Share API が使えるときは共有シート経由も選べるようにした。
+
+import React, { useMemo, useState } from 'react';
+import { TrackedObject, FrameData, FilterSettings, ScaleCalibration } from '../../types';
+import { applySavitzkyGolay } from '../../utils/savitzkyGolay';
+import { autoFilter, butterworthZeroPhase, derivative, medianDt } from '../../utils/butterworth';
+import { isCalibrated } from '../../utils/calibration';
+import { Card, Slider, Switch } from '../ui';
+import { GraphPanel } from '../GraphPanel';
+import { AxisKey } from '../MotionGraph';
+import {
+  Download, Share2, Sliders, Activity, ArrowRightLeft, ChevronDown, ChevronUp,
+  LineChart, Maximize2, X,
+} from 'lucide-react';
+
+interface Props {
+  objects: TrackedObject[];
+  historyData: FrameData[];
+  filterSettings: FilterSettings;
+  onUpdateFilterSettings: (s: FilterSettings) => void;
+  calibration: ScaleCalibration;
+  /** グラフをタップしたとき、その時刻へ動画をシークする */
+  onSeek?: (t: number) => void;
+  /** グラフの軸の選択。シートを閉じても保つよう App が持っている */
+  graphX: AxisKey;
+  graphY: AxisKey;
+  onChangeGraphX: (k: AxisKey) => void;
+  onChangeGraphY: (k: AxisKey) => void;
+  hiddenGraphIds: string[];
+  onToggleGraphId: (id: string) => void;
+}
+
+export const DataSheet: React.FC<Props> = ({
+  objects, historyData, filterSettings, onUpdateFilterSettings, calibration, onSeek,
+  graphX, graphY, onChangeGraphX, onChangeGraphY, hiddenGraphIds, onToggleGraphId,
+}) => {
+  const activeObjects = useMemo(() => objects.filter(o => o.active), [objects]);
+  const [showFilter, setShowFilter] = useState(false);
+  const unitLabel = isCalibrated(calibration) ? calibration.unit : 'px';
+  const [graphFull, setGraphFull] = useState(false);
+
+  // -------------------------------------------------
+  // 平滑化と速度の再計算
+  // -------------------------------------------------
+
+  const { processedData, report } = useMemo(() => {
+    const cutoffs: { [id: string]: number } = {};
+    if (historyData.length === 0) {
+      return { processedData: historyData, report: { cutoffs, sampleRate: 0 } };
+    }
+
+    const copyData: FrameData[] = historyData.map(fd => ({
+      frameIndex: fd.frameIndex,
+      timestamp: fd.timestamp,
+      objects: Object.fromEntries(Object.entries(fd.objects).map(([k, v]) => [k, { ...v }])),
+      distances: { ...fd.distances },
+    }));
+
+    const dtAll = medianDt(copyData.map(f => f.timestamp));
+    const sampleRate = dtAll > 0 ? 1 / dtAll : 0;
+
+    activeObjects.forEach(obj => {
+      const idx: number[] = [];
+      for (let i = 0; i < copyData.length; i++) {
+        if (copyData[i].objects[obj.id]) idx.push(i);
+      }
+      if (idx.length === 0) return;
+
+      const rawX = idx.map(i => copyData[i].objects[obj.id].xM);
+      const rawY = idx.map(i => copyData[i].objects[obj.id].yM);
+      const t = idx.map(i => copyData[i].timestamp);
+      const dt = medianDt(t);
+
+      let sx = rawX;
+      let sy = rawY;
+
+      if (filterSettings.enabled && filterSettings.kind === 'butterworth' && dt > 0) {
+        if (filterSettings.autoCutoff) {
+          const rx = autoFilter(rawX, dt);
+          const ry = autoFilter(rawY, dt);
+          sx = rx.values;
+          sy = ry.values;
+          cutoffs[obj.id] = (rx.cutoff + ry.cutoff) / 2;
+        } else {
+          sx = butterworthZeroPhase(rawX, dt, filterSettings.cutoffHz);
+          sy = butterworthZeroPhase(rawY, dt, filterSettings.cutoffHz);
+          cutoffs[obj.id] = filterSettings.cutoffHz;
+        }
+      } else if (filterSettings.enabled && filterSettings.kind === 'savgol') {
+        sx = applySavitzkyGolay(rawX, filterSettings.windowSize, filterSettings.polynomialOrder);
+        sy = applySavitzkyGolay(rawY, filterSettings.windowSize, filterSettings.polynomialOrder);
+      }
+
+      const vxs = derivative(sx, t);
+      const vys = derivative(sy, t);
+
+      for (let k = 0; k < idx.length; k++) {
+        const item = copyData[idx[k]].objects[obj.id];
+        item.xM = sx[k];
+        item.yM = sy[k];
+        item.vx = vxs[k];
+        item.vy = vys[k];
+        item.speedMs = Math.hypot(vxs[k], vys[k]);
+      }
+    });
+
+    copyData.forEach(fd => {
+      for (let i = 0; i < activeObjects.length; i++) {
+        for (let j = i + 1; j < activeObjects.length; j++) {
+          const idA = activeObjects[i].id;
+          const idB = activeObjects[j].id;
+          const a = fd.objects[idA];
+          const b = fd.objects[idB];
+          if (a && b && !a.lost && !b.lost) {
+            fd.distances[`${idA}-${idB}`] = Math.hypot(a.xM - b.xM, a.yM - b.yM);
+          }
+        }
+      }
+    });
+
+    return { processedData: copyData, report: { cutoffs, sampleRate } };
+  }, [historyData, filterSettings, activeObjects]);
+
+  const latest = processedData.length > 0 ? processedData[processedData.length - 1] : null;
+
+  // -------------------------------------------------
+  // CSV
+  // -------------------------------------------------
+
+  const buildCsv = (): string => {
+    const u = isCalibrated(calibration) ? calibration.unit : 'px';
+    const headers: string[] = ['Timestamp(s)'];
+
+    activeObjects.forEach(obj => {
+      headers.push(
+        `${obj.id}_X(px)`, `${obj.id}_Y(px)`,
+        `${obj.id}_X(${u})`, `${obj.id}_Y(${u})`,
+        `${obj.id}_Vx(${u}/s)`, `${obj.id}_Vy(${u}/s)`, `${obj.id}_Speed(${u}/s)`,
+        `${obj.id}_Score`, `${obj.id}_Lost`, `${obj.id}_Manual`,
+      );
+    });
+    for (let i = 0; i < activeObjects.length; i++) {
+      for (let j = i + 1; j < activeObjects.length; j++) {
+        headers.push(`Dist_${activeObjects[i].id}_${activeObjects[j].id}(${u})`);
+      }
+    }
+
+    const rows: string[] = [headers.join(',')];
+    processedData.forEach(fd => {
+      const row: (string | number)[] = [fd.timestamp.toFixed(6)];
+      activeObjects.forEach(obj => {
+        const it = fd.objects[obj.id];
+        if (it) {
+          row.push(
+            it.xPx.toFixed(3), it.yPx.toFixed(3),
+            it.xM.toFixed(6), it.yM.toFixed(6),
+            it.vx.toFixed(6), it.vy.toFixed(6), it.speedMs.toFixed(6),
+            it.score.toFixed(3), it.lost ? '1' : '0', it.manual ? '1' : '0',
+          );
+        } else {
+          row.push('', '', '', '', '', '', '', '', '', '');
+        }
+      });
+      for (let i = 0; i < activeObjects.length; i++) {
+        for (let j = i + 1; j < activeObjects.length; j++) {
+          const d = fd.distances[`${activeObjects[i].id}-${activeObjects[j].id}`];
+          row.push(d !== undefined ? d.toFixed(5) : '');
+        }
+      }
+      rows.push(row.join(','));
+    });
+
+    // BOM 付き UTF-8（Excel で文字化けしないように）
+    return '\uFEFF' + rows.join('\n');
+  };
+
+  const fileName = () =>
+    `motion_trace_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+
+  const downloadCSV = () => {
+    if (processedData.length === 0) return;
+    const blob = new Blob([buildCsv()], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  /** 共有シート経由でファイルを渡す（iOS ではこちらの方が確実） */
+  const canShare = typeof navigator !== 'undefined' && 'canShare' in navigator;
+  const shareCSV = async () => {
+    if (processedData.length === 0) return;
+    try {
+      const file = new File([buildCsv()], fileName(), { type: 'text/csv' });
+      const nav = navigator as any;
+      if (nav.canShare?.({ files: [file] })) {
+        await nav.share({ files: [file], title: 'MotionTrace 計測データ' });
+        return;
+      }
+    } catch (err) {
+      console.warn('[DataSheet] 共有できませんでした:', err);
+    }
+    downloadCSV();
+  };
+
+  // -------------------------------------------------
+
+  return (
+    <>
+      {/* ---- グラフ概形 ---- */}
+      <Card
+        title={<><LineChart size={16} color="var(--accent-primary)" />グラフ概形</>}
+        right={
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => setGraphFull(true)}
+            disabled={processedData.length === 0}
+            aria-label="全画面で見る"
+          >
+            <Maximize2 size={14} />拡大
+          </button>
+        }
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <GraphPanel
+            objects={objects}
+            data={processedData}
+            unit={unitLabel}
+            xKey={graphX}
+            yKey={graphY}
+            onChangeX={onChangeGraphX}
+            onChangeY={onChangeGraphY}
+            hiddenIds={hiddenGraphIds}
+            onToggleId={onToggleGraphId}
+            onSeek={onSeek}
+            height={196}
+          />
+          <div className="hint">
+            グラフをタップするとその時刻へ動画が移動します。
+            vx-t / vy-t に鋭いスパイクが出ていたら、そこで追跡が飛んでいます。
+            タップして飛び、映像の「修正」ツールで直してください。
+          </div>
+        </div>
+      </Card>
+
+      {/* ---- 全画面グラフ ---- */}
+      {graphFull && (
+        <div className="graph-full">
+          <div className="graph-full__head">
+            <div className="card__title" style={{ marginBottom: 0 }}>
+              <LineChart size={16} color="var(--accent-primary)" />
+              グラフ概形
+            </div>
+            <button
+              className="btn btn-secondary btn-icon btn-sm"
+              onClick={() => setGraphFull(false)}
+              aria-label="閉じる"
+            >
+              <X size={17} />
+            </button>
+          </div>
+          <GraphPanel
+            objects={objects}
+            data={processedData}
+            unit={unitLabel}
+            xKey={graphX}
+            yKey={graphY}
+            onChangeX={onChangeGraphX}
+            onChangeY={onChangeGraphY}
+            hiddenIds={hiddenGraphIds}
+            onToggleId={onToggleGraphId}
+            onSeek={onSeek}
+          />
+        </div>
+      )}
+
+      {/* ---- 現在値 ---- */}
+      <Card
+        title={<><Activity size={16} color="var(--accent-primary)" />計測値</>}
+        right={<span className="badge">単位 {unitLabel}</span>}
+      >
+        {activeObjects.length === 0 ? (
+          <div className="hint" style={{ textAlign: 'center', padding: '10px 0' }}>追跡オブジェクトなし</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+            {activeObjects.map(obj => {
+              const it = latest?.objects[obj.id];
+              const lost = obj.status === 'lost';
+              const exited = obj.status === 'exited';
+              return (
+                <div
+                  key={obj.id}
+                  style={{
+                    background: 'var(--bg-secondary)',
+                    padding: '9px 12px',
+                    borderRadius: 'var(--radius-sm)',
+                    borderLeft: `4px solid ${lost ? 'var(--color-danger)' : exited ? 'var(--color-warning)' : obj.color}`,
+                    opacity: lost || exited ? 0.72 : 1,
+                  }}
+                >
+                  <div className="row-between" style={{ marginBottom: 5 }}>
+                    <div className="row">
+                      <div className={`status-dot ${obj.status}`} />
+                      <span style={{ fontWeight: 600, fontSize: '0.85rem' }}>{obj.name}</span>
+                      {exited && <span className="badge badge-warn">追尾終了</span>}
+                    </div>
+                    <span className="mono" style={{ fontSize: '0.82rem', color: '#a5b4fc', fontWeight: 700 }}>
+                      {it ? it.speedMs.toFixed(3) : '0.000'} {unitLabel}/s
+                    </span>
+                  </div>
+                  <div style={{
+                    display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4,
+                    fontSize: '0.76rem', color: 'var(--text-secondary)',
+                  }}>
+                    <div>X <span className="mono" style={{ color: 'var(--text-primary)' }}>
+                      {it ? it.xM.toFixed(4) : '—'}</span></div>
+                    <div>Y <span className="mono" style={{ color: 'var(--text-primary)' }}>
+                      {it ? it.yM.toFixed(4) : '—'}</span></div>
+                    <div>Vx <span className="mono" style={{ color: 'var(--text-primary)' }}>
+                      {it ? it.vx.toFixed(3) : '—'}</span></div>
+                    <div>Vy <span className="mono" style={{ color: 'var(--text-primary)' }}>
+                      {it ? it.vy.toFixed(3) : '—'}</span></div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {activeObjects.length >= 2 && (
+          <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border-subtle)' }}>
+            <div className="row" style={{ fontSize: '0.79rem', color: 'var(--text-secondary)', marginBottom: 7 }}>
+              <ArrowRightLeft size={13} />相対距離
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {activeObjects.flatMap((a, i) =>
+                activeObjects.slice(i + 1).map(b => {
+                  const d = latest?.distances[`${a.id}-${b.id}`];
+                  return (
+                    <div key={`${a.id}-${b.id}`} className="row-between" style={{
+                      fontSize: '0.77rem', background: 'rgba(255,255,255,0.03)',
+                      padding: '6px 10px', borderRadius: 7,
+                    }}>
+                      <span className="row">
+                        <span className="obj-swatch" style={{ background: a.color, width: 9, height: 9 }} />
+                        <span className="obj-swatch" style={{ background: b.color, width: 9, height: 9 }} />
+                        <span style={{ color: 'var(--text-secondary)' }}>{a.id} ↔ {b.id}</span>
+                      </span>
+                      <span className="mono" style={{ fontWeight: 700 }}>
+                        {d !== undefined ? `${d.toFixed(4)} ${unitLabel}` : '—'}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* ---- 書き出し ---- */}
+      <Card>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            className="btn btn-primary"
+            style={{ flex: 1 }}
+            onClick={downloadCSV}
+            disabled={processedData.length === 0}
+          >
+            <Download size={17} />CSV 保存
+          </button>
+          {canShare && (
+            <button
+              className="btn btn-secondary"
+              onClick={shareCSV}
+              disabled={processedData.length === 0}
+              aria-label="共有"
+            >
+              <Share2 size={17} />共有
+            </button>
+          )}
+        </div>
+        <div className="hint" style={{ marginTop: 8 }}>
+          {processedData.length} フレーム分 ／ BOM付きUTF-8（Excel対応）
+          {calibration.mode === 'plane' && calibration.homography && ' ／ 射影変換で遠近補正済み'}
+          {filterSettings.enabled && ' ／ フィルタ適用後の値'}
+        </div>
+      </Card>
+
+      {/* ---- フィルタ ---- */}
+      <Card
+        title={<><Sliders size={16} color="var(--accent-primary)" />座標フィルタ</>}
+        right={
+          <button className="btn btn-secondary btn-sm" onClick={() => setShowFilter(v => !v)}>
+            {showFilter ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </button>
+        }
+      >
+        <Switch
+          checked={filterSettings.enabled}
+          onChange={v => onUpdateFilterSettings({ ...filterSettings, enabled: v })}
+          label="ノイズ除去を使う"
+        />
+
+        {filterSettings.enabled && (
+          <div className="hint" style={{ marginTop: 4 }}>
+            {filterSettings.kind === 'butterworth'
+              ? `Butterworth 零位相${filterSettings.autoCutoff ? '・遮断周波数は自動' : `・${filterSettings.cutoffHz}Hz 固定`}`
+              : `Savitzky-Golay・${filterSettings.windowSize}点 ${filterSettings.polynomialOrder}次`}
+            {report.sampleRate > 0 && `（サンプリング ${report.sampleRate.toFixed(1)} Hz）`}
+          </div>
+        )}
+
+        {showFilter && filterSettings.enabled && (
+          <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 12 }}>
+            <div className="segmented" style={{ gridTemplateColumns: '1fr 1fr' }}>
+              <button
+                className={`btn ${filterSettings.kind === 'butterworth' ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => onUpdateFilterSettings({ ...filterSettings, kind: 'butterworth' })}
+              >
+                Butterworth
+              </button>
+              <button
+                className={`btn ${filterSettings.kind === 'savgol' ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => onUpdateFilterSettings({ ...filterSettings, kind: 'savgol' })}
+              >
+                Savitzky-Golay
+              </button>
+            </div>
+
+            {filterSettings.kind === 'butterworth' && (
+              <>
+                <Switch
+                  checked={filterSettings.autoCutoff}
+                  onChange={v => onUpdateFilterSettings({ ...filterSettings, autoCutoff: v })}
+                  label="遮断周波数を自動で決める（推奨）"
+                />
+                {filterSettings.autoCutoff ? (
+                  <div className="notice notice-info" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 4 }}>
+                    <span>
+                      残差の自己相関（Durbin-Watson 統計量）が最小になる遮断周波数を、
+                      0.5Hz からナイキスト周波数まで走査して自動で選びます。
+                    </span>
+                    {activeObjects.map(o => (
+                      report.cutoffs[o.id] !== undefined ? (
+                        <span key={o.id} className="mono" style={{ color: '#10d97c', fontSize: '0.74rem' }}>
+                          {o.id}: {report.cutoffs[o.id].toFixed(2)} Hz
+                        </span>
+                      ) : null
+                    ))}
+                  </div>
+                ) : (
+                  <Slider
+                    label="遮断周波数"
+                    value={filterSettings.cutoffHz}
+                    display={`${filterSettings.cutoffHz.toFixed(1)} Hz`}
+                    min={0.5}
+                    max={Math.max(2, report.sampleRate > 0 ? report.sampleRate / 2 : 15)}
+                    step={0.1}
+                    onChange={v => onUpdateFilterSettings({ ...filterSettings, cutoffHz: v })}
+                    hint="低くするほど滑らかになりますが、下げすぎると本物の運動まで削られます"
+                  />
+                )}
+              </>
+            )}
+
+            {filterSettings.kind === 'savgol' && (
+              <>
+                <div className="row-between">
+                  <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>ウィンドウ幅</span>
+                  <select
+                    style={{ width: 120 }}
+                    value={filterSettings.windowSize}
+                    onChange={e => onUpdateFilterSettings({
+                      ...filterSettings, windowSize: parseInt(e.target.value, 10),
+                    })}
+                  >
+                    {[3, 5, 7, 9, 11, 15].map(n => <option key={n} value={n}>{n} 点</option>)}
+                  </select>
+                </div>
+                <div className="row-between">
+                  <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>多項式次数</span>
+                  <select
+                    style={{ width: 120 }}
+                    value={filterSettings.polynomialOrder}
+                    onChange={e => onUpdateFilterSettings({
+                      ...filterSettings, polynomialOrder: parseInt(e.target.value, 10),
+                    })}
+                  >
+                    <option value={2}>2次</option>
+                    <option value={3}>3次</option>
+                  </select>
+                </div>
+              </>
+            )}
+
+            <div className="hint">
+              位置を微分して速度を出すとノイズが Δt で割られて増幅されます。
+              微分の前に平滑化するのが定石で、検証では速度の誤差が約 70% 減りました。
+              フィルタは画面表示と CSV 出力の両方に効きます。
+            </div>
+          </div>
+        )}
+      </Card>
+    </>
+  );
+};
