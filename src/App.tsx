@@ -27,6 +27,9 @@ import { ObjectTracker, MIN_ROI_SIZE, RECOMMENDED_ROI_SIZE } from './utils/track
 import { FrameSource } from './utils/frameSource';
 import { toReal } from './utils/calibration';
 import { medianDt } from './utils/butterworth';
+import {
+  placeManualPoint, undoManualPoint, isFrameComplete, ManualEdit,
+} from './utils/manualTrack';
 
 import { TopBar } from './components/TopBar';
 import { VideoStage, StageTool } from './components/VideoStage';
@@ -366,6 +369,64 @@ export const App: React.FC = () => {
   // 手動修正（キーフレーム編集）
   // -------------------------------------------------
 
+  // -------------------------------------------------
+  // 手動トラッキング
+  // -------------------------------------------------
+  //
+  // 自動追跡が使えない対象（変形する物体、低コントラスト、遮蔽が多い）を
+  // コマごとに人が指してデータにする。記録先は自動追跡と同じ historyData で、
+  // 手で打った点には manual: true が付く。
+
+  /** 取り消し用の履歴。手動で打った操作だけを積む */
+  const manualUndoRef = useRef<ManualEdit[]>([]);
+
+  /** 同じコマとみなす時刻の許容差 */
+  const frameTolerance = useCallback(() => {
+    const hist = historyDataRef.current;
+    const dt = hist.length > 1 ? medianDt(hist.map(f => f.timestamp)) : 0;
+    const base = dt > 0 ? dt : 1 / Math.max(1, fpsSettings.value);
+    return base * 0.5;
+  }, [fpsSettings.value]);
+
+  /**
+   * 手動で 1 点打つ。
+   * @param fileTime 実際に表示されているフレームの時刻（要求時刻ではない）
+   */
+  const handleManualPlace = useCallback(
+    (objId: string, center: Point, fileTime: number): boolean => {
+      const real = toReal(
+        calibrationRef.current, center, frameSourceRef.current?.height || 0
+      );
+      const edit = placeManualPoint(
+        historyDataRef.current, objId, fileTime, center, real,
+        frameTolerance(),
+        Math.round(fileTime * Math.max(1, fpsSettings.value))
+      );
+      manualUndoRef.current.push(edit);
+      flushHistory(true);
+      setObjects(prev => prev.map(o =>
+        o.id === objId ? { ...o, center, status: 'tracking' as ObjectStatus } : o
+      ));
+
+      // 打った直後の状態を持っているのは historyDataRef だけ。
+      // 打つ順番を入れ替えられるので「残り 1 つか」は事前に決められない
+      const order = objectsRef.current.filter(o => o.active).map(o => o.id);
+      return isFrameComplete(
+        historyDataRef.current, order, fileTime, frameTolerance()
+      );
+    },
+    [flushHistory, frameTolerance, fpsSettings.value]
+  );
+
+  /** 直前に打った点を取り消す */
+  const handleManualUndo = useCallback((): boolean => {
+    const edit = manualUndoRef.current.pop();
+    if (!edit) return false;
+    const ok = undoManualPoint(historyDataRef.current, edit, frameTolerance());
+    flushHistory(true);
+    return ok;
+  }, [flushHistory, frameTolerance]);
+
   /**
    * @returns 記録データを実際に書き換えられたか。
    *   false のときは枠だけが動いた状態なので、呼び出し側で知らせる必要がある。
@@ -633,6 +694,8 @@ export const App: React.FC = () => {
         selectedObjId={selectedObjId}
         onUpdateRoi={handleUpdateRoi}
         onManualCorrect={handleManualCorrect}
+        onManualPlace={handleManualPlace}
+        onManualUndo={handleManualUndo}
         calibration={calibration}
         onUpdateCalibration={setCalibration}
         onProcessFrame={handleProcessFrame}

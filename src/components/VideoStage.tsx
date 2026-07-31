@@ -18,7 +18,7 @@
 // getBoundingClientRect() から素直に逆算できる。
 // ============================================================
 
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import {
   TrackedObject, ScaleCalibration, Rect, Point, FrameData, FpsSettings,
 } from '../types';
@@ -26,12 +26,19 @@ import { recalcScale, pixelDistance } from '../utils/calibration';
 import { applyHomography, invertHomography, Matrix3 } from '../utils/homography';
 import { MIN_ROI_SIZE, RECOMMENDED_ROI_SIZE } from '../utils/tracker';
 import { stepFrames, probeFileFps, seekToFrameTime } from '../utils/videoFrame';
+import { medianDt } from '../utils/butterworth';
+import {
+  nextManualTarget, countManualPoints, manualStepInterval,
+  recommendManualStep, MANUAL_INTERVAL_WARN,
+} from '../utils/manualTrack';
+import { timeScale } from '../utils/timeScale';
 import {
   Play, Pause, RotateCcw, Upload, Hand, Square, Move, Crosshair, Target,
+  MousePointerClick, Undo2,
   ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Route,
 } from 'lucide-react';
 
-export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin';
+export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual';
 
 interface VideoStageProps {
   objects: TrackedObject[];
@@ -39,6 +46,10 @@ interface VideoStageProps {
   onUpdateRoi: (id: string, roi: Rect, videoEl?: HTMLVideoElement) => void;
   /** 追跡点を手で直す。記録データを書き換えられたかを返す */
   onManualCorrect: (id: string, center: Point, timestamp: number, videoEl?: HTMLVideoElement) => boolean;
+  /** 手動トラッキングで 1 点打つ。そのコマを打ち切ったら true */
+  onManualPlace: (id: string, center: Point, fileTime: number) => boolean;
+  /** 手動トラッキングの直前の 1 点を取り消す */
+  onManualUndo: () => boolean;
   calibration: ScaleCalibration;
   onUpdateCalibration: (calib: ScaleCalibration) => void;
   onProcessFrame: (videoEl: HTMLVideoElement, timestamp: number, frameIndex: number) => void;
@@ -92,7 +103,7 @@ interface View {
 }
 
 export const VideoStage: React.FC<VideoStageProps> = ({
-  objects, selectedObjId, onUpdateRoi, onManualCorrect,
+  objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
   historyData, onResetData, onClearTrail, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
@@ -134,6 +145,18 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const frameTimeRef = useRef(0);
   /** コマ送りの多重実行を防ぐ（連打でシークが交錯すると位置が飛ぶ） */
   const steppingRef = useRef(false);
+  /** 手動トラッキング: 1 回打ったあとに進めるコマ数 */
+  const [manualStep, setManualStep] = useState(1);
+  /** ユーザーが自分でコマ数を決めたか（決めていれば自動で上書きしない） */
+  const manualStepTouched = useRef(false);
+  /** 手動トラッキング: 操作結果を伝える一言 */
+  const [manualMsg, setManualMsg] = useState<string | null>(null);
+  /**
+   * 次に打つ物体をユーザーが指名した場合の id。
+   * null なら自動の順番（そのコマでまだ打っていない先頭）に従う。
+   * 打ち間違えたときや、見えている物体から先に打ちたいときのための逃げ道。
+   */
+  const [manualPick, setManualPick] = useState<string | null>(null);
 
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchRef = useRef<{ dist: number; mid: { x: number; y: number } } | null>(null);
@@ -383,6 +406,70 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   useEffect(() => { if (tool !== 'correct') setCorrectMsg(null); }, [tool]);
 
+  /**
+   * n コマ分だけ進む／戻る。
+   *
+   * 進んだあとに「実際に表示されたフレームの時刻」を読み直して覚えておく。
+   * fps の推定がずれていても、この値を起点に次のコマを狙うので
+   * 誤差が積み上がらない。手動トラッキングはこの時刻を記録に使う。
+   */
+  const stepFrame = useCallback(async (n: number) => {
+    const v = videoRef.current;
+    if (!v || !videoLoaded || steppingRef.current) return;
+    steppingRef.current = true;
+    v.pause();
+    setIsPlaying(false);
+    try {
+      const t = await stepFrames(v, fpsRef.current.value, n);
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+    } finally {
+      steppingRef.current = false;
+    }
+  }, [videoLoaded, setIsPlaying]);
+
+  // =========================================================
+  // 手動トラッキング
+  // =========================================================
+
+  /** 同じコマとみなす時刻の許容差。App 側と同じ基準にそろえる */
+  const frameTolerance = useMemo(() => {
+    const dt = historyData.length > 1
+      ? medianDt(historyData.map(f => f.timestamp))
+      : 0;
+    return (dt > 0 ? dt : 1 / Math.max(1, fpsSettings.value)) * 0.5;
+  }, [historyData, fpsSettings.value]);
+
+  /** 「n コマおき」が実時間で何秒になるか。加速度の精度はここで決まる */
+  const manualInterval = manualStepInterval(
+    manualStep, fpsSettings.value, timeScale(fpsSettings)
+  );
+
+  // fps や撮影fps が決まったら、間隔が適切になるコマ数を提案する。
+  // 240fps スローで 1 コマおきに打つと実時間 4ms しか空かず、
+  // 加速度のばらつきが 40% にもなる（合成データでの実測）。
+  useEffect(() => {
+    if (manualStepTouched.current) return;
+    setManualStep(recommendManualStep(fpsSettings.value, timeScale(fpsSettings)));
+  }, [fpsSettings]);
+
+  /** 打つ対象の並び */
+  const manualOrder = objects.filter(o => o.active).map(o => o.id);
+
+  /** いま打つべき物体と、それがそのコマの最後かどうか */
+  const manualTarget = nextManualTarget(
+    historyData, manualOrder, frameTimeRef.current, frameTolerance
+  );
+
+  /** 操作結果の表示は少し経ったら消す */
+  useEffect(() => {
+    if (!manualMsg) return;
+    const id = window.setTimeout(() => setManualMsg(null), 2000);
+    return () => window.clearTimeout(id);
+  }, [manualMsg]);
+
+  useEffect(() => { if (tool !== 'manual') setManualMsg(null); }, [tool]);
+
   // =========================================================
   // ポインタ操作
   // =========================================================
@@ -390,8 +477,45 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const beginSingle = useCallback((pt: Point, screen: { x: number; y: number }) => {
     const hitR = HANDLE_TOUCH_PX * canvasPerScreen();
 
+    // ---- 手動トラッキング ----
+    // タップした位置がそのままその物体・そのコマの記録になる。
+    // 記録する時刻は「要求した時刻」ではなく、実際に表示されているフレームの時刻。
+    if (tool === 'manual' && !isPlaying) {
+      const objId = manualPick ?? nextManualTarget(
+        historyData, manualOrder, frameTimeRef.current, frameTolerance
+      ).objId;
+      if (!objId) {
+        setManualMsg('追跡対象がありません');
+        return;
+      }
+      const complete = onManualPlace(objId, pt, frameTimeRef.current);
+      // 指名は 1 回きり。打ったら自動の順番に戻す
+      setManualPick(null);
+      if (complete) {
+        setManualMsg(`${objId} を記録 → ${manualStep} コマ進みます`);
+        void stepFrame(manualStep);
+      } else {
+        setManualMsg(`${objId} を記録`);
+      }
+      return;
+    }
+
     // ---- 原点指定 ----
     // 他のどのツールよりも先に見る。1 タップで確定して移動ツールへ戻る。
+    if (tool === 'manual') {
+      return {
+        text: manualMsg ?? (
+          isPlaying
+            ? '一時停止してから対象をタップしてください'
+            : manualTarget.objId
+              ? `${manualTarget.objId} の位置をタップ${
+                  manualTarget.isLast ? `（次で ${manualStep} コマ進みます）` : ''
+                }`
+              : '追跡対象がありません'
+        ),
+        bg: 'rgba(10,132,255,0.95)', color: '#fff',
+      };
+    }
     if (tool === 'origin') {
       onUpdateCalibration({
         ...calibration,
@@ -478,6 +602,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   }, [
     tool, calibration, objects, canvasPerScreen, setCalibHandle, isLineCalibrating,
     nearestFrameIndex, grabPoint, onUpdateCalibration, setTool,
+    historyData, frameTolerance, onManualPlace, manualStep, stepFrame, isPlaying,
+    manualOrder.join(','), manualPick,
   ]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1019,6 +1145,34 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       }
     }
 
+    // ----- 手動記録: そのコマに打ってある点を示す -----
+    // どの物体を打つ番か分からなくなるのが一番の混乱なので、
+    // 現在のコマに既に打ってある点を色付きで示す。
+    if (tool === 'manual' && !isPlaying) {
+      const cur = historyData.find(
+        f => Math.abs(f.timestamp - frameTimeRef.current) <= frameTolerance
+      );
+      objects.filter(o => o.active).forEach(o => {
+        const it = cur?.objects[o.id];
+        if (!it || it.lost) return;
+        ctx.beginPath();
+        ctx.arc(it.xPx, it.yPx, 8 * k, 0, Math.PI * 2);
+        ctx.fillStyle = o.color;
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+        ctx.lineWidth = 2 * k;
+        ctx.stroke();
+        ctx.font = `bold ${12 * k}px Inter, sans-serif`;
+        ctx.fillStyle = '#fff';
+        ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+        ctx.lineWidth = 3 * k;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.strokeText(o.id, it.xPx + 12 * k, it.yPx);
+        ctx.fillText(o.id, it.xPx + 12 * k, it.yPx);
+      });
+    }
+
     // ----- 原点 -----
     // 指定されているときだけ描く。未指定なら従来どおり画像の隅が原点で、
     // そこに印を出しても情報量がないため。
@@ -1085,7 +1239,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   }, [
     historyData, objects, selectedObjId, showTrail, gesture, dragStart, dragCurrent,
     squareMode, calibration, tool, isPlaying, roiSize, linePending, calibHandle,
-    canvasPerScreen, view.z, nearestFrameIndex, grabPoint,
+    canvasPerScreen, view.z, nearestFrameIndex, grabPoint, frameTolerance,
   ]);
 
   renderRef.current = renderFrame;
@@ -1256,27 +1410,6 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     onClearTrail();
   };
 
-  /**
-   * n コマ分だけ進む／戻る。
-   *
-   * 進んだあとに「実際に表示されたフレームの時刻」を読み直して覚えておく。
-   * fps の推定がずれていても、この値を起点に次のコマを狙うので
-   * 誤差が積み上がらない。手動トラッキングはこの時刻を記録に使う。
-   */
-  const stepFrame = useCallback(async (n: number) => {
-    const v = videoRef.current;
-    if (!v || !videoLoaded || steppingRef.current) return;
-    steppingRef.current = true;
-    v.pause();
-    setIsPlaying(false);
-    try {
-      const t = await stepFrames(v, fpsRef.current.value, n);
-      frameTimeRef.current = t;
-      setCurrentTime(t);
-    } finally {
-      steppingRef.current = false;
-    }
-  }, [videoLoaded, setIsPlaying]);
 
   // =========================================================
   // 表示用の派生値
@@ -1400,6 +1533,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             {toolBtn('pan', <Hand size={17} />, '移動')}
             {toolBtn('roi', <Square size={17} />, '枠を指定')}
             {toolBtn('correct', <Move size={17} />, '手動修正')}
+            {toolBtn('manual', <MousePointerClick size={17} />, '手動記録')}
             {toolBtn('origin', <Target size={17} />, '原点')}
             {(isLineCalibrating || tool === 'calib') && toolBtn('calib', <Crosshair size={17} />, '校正')}
           </div>
@@ -1512,6 +1646,83 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             ))}
           </div>
         </div>
+
+        {/* 打つ物体を選ぶ列。順番どおりでない打ち方をしたいときの逃げ道 */}
+        {tool === 'manual' && manualOrder.length > 1 && (
+          <div className="playbar__row" style={{ gap: 6 }}>
+            <span style={{ fontSize: '0.74rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+              次に打つ
+            </span>
+            {objects.filter(o => o.active).map(o => {
+              const isNext = (manualPick ?? manualTarget.objId) === o.id;
+              const cur = historyData.find(
+                f => Math.abs(f.timestamp - frameTimeRef.current) <= frameTolerance
+              );
+              const done = !!cur?.objects[o.id]?.manual;
+              return (
+                <button
+                  key={o.id}
+                  className="chip"
+                  onClick={() => setManualPick(o.id)}
+                  style={{
+                    minHeight: 34, padding: '4px 11px', fontSize: '0.74rem', fontWeight: 700,
+                    background: isNext ? o.color : undefined,
+                    color: isNext ? '#fff' : undefined,
+                    borderColor: isNext ? o.color : undefined,
+                    opacity: done && !isNext ? 0.55 : 1,
+                  }}
+                >
+                  <span style={{
+                    display: 'inline-block', width: 7, height: 7, borderRadius: '50%',
+                    background: isNext ? '#fff' : o.color, marginRight: 5,
+                  }} />
+                  {o.id}{done ? ' ✓' : ''}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* 手動記録のときだけ出す操作列。指で押せる大きさを確保する */}
+        {tool === 'manual' && (
+          <div className="playbar__row" style={{ gap: 8 }}>
+            <span style={{ fontSize: '0.74rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+              コマ送り
+            </span>
+            <input
+              type="range" min={1} max={30} step={1} value={manualStep}
+              onChange={e => {
+                manualStepTouched.current = true;
+                setManualStep(parseInt(e.target.value));
+              }}
+              style={{ flex: 1 }}
+            />
+            {/* 実時間の間隔を出す。加速度の精度はここでほぼ決まるので、
+                コマ数だけ見せても判断できない */}
+            <span
+              className="mono"
+              style={{
+                fontSize: '0.74rem', fontWeight: 700, whiteSpace: 'nowrap',
+                color: manualInterval < MANUAL_INTERVAL_WARN ? '#fcd34d' : undefined,
+              }}
+            >
+              {manualStep} / {(manualInterval * 1000).toFixed(0)}ms
+            </span>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => {
+                setManualMsg(onManualUndo() ? '直前の 1 点を取り消しました' : '取り消せる点がありません');
+              }}
+              aria-label="直前に打った点を取り消す"
+            >
+              <Undo2 size={15} />
+              取消
+            </button>
+            <span className="mono" style={{ fontSize: '0.72rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+              {countManualPoints(historyData)} 点
+            </span>
+          </div>
+        )}
 
         <div className="playbar__row">
           <input
