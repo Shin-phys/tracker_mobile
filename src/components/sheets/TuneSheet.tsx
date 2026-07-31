@@ -7,6 +7,7 @@ import {
   FpsSettings, TrackingSettings, MarkerMode, DEFAULT_TRACKING,
 } from '../../types';
 import { Card, Slider, Switch } from '../ui';
+import { CAPTURE_FPS_PRESETS, describeTimeScale, isTimeScaled } from '../../utils/timeScale';
 import { Timer, Settings2, RotateCcw, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface Props {
@@ -29,48 +30,63 @@ export const TuneSheet: React.FC<Props> = ({
 
   return (
     <>
-      {/* ---- FPS ---- */}
-      <Card title={<><Timer size={16} color="var(--accent-primary)" />FPS 設定</>}>
-        <div className={`notice ${fpsSettings.source === 'auto' ? 'notice-info' : 'notice-warn'}`}>
-          {fpsSettings.source === 'auto'
-            ? `自動計測中 — 再生すると実フレーム間隔から更新されます（現在 ${fpsSettings.value.toFixed(2)} fps）`
-            : '手動入力（自動計測は行いません）'}
+      {/* ---- フレームレートと時間軸 ---- */}
+      <Card title={<><Timer size={16} color="var(--accent-primary)" />フレームレートと時間軸</>}>
+        <div className="notice notice-info">
+          ファイルのfps: <b>{fpsSettings.value.toFixed(2)} fps</b>（自動計測）
+          <div style={{ marginTop: 3, opacity: 0.85 }}>
+            再生すると実フレーム間隔から自動で決まります。コマ送りの刻み幅に使われます。
+          </div>
         </div>
 
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 12, fontSize: '0.81rem', color: 'var(--text-secondary)' }}>
+          撮影fps（スロー動画のときに指定）
+        </div>
+        <div style={{ marginTop: 5 }}>
           <input
-            type="number" inputMode="decimal" step="0.001" min="1" max="1000"
+            type="number" inputMode="numeric" step="1" min="0" max="2000"
             className="num-lg"
-            value={fpsSettings.value}
+            value={fpsSettings.captureFps || ''}
+            placeholder="未指定（通常の動画）"
             onFocus={e => e.currentTarget.select()}
             onChange={e => {
               const v = parseFloat(e.target.value);
-              if (v > 0) onUpdateFpsSettings({ value: v, source: 'manual' });
+              onUpdateFpsSettings({
+                ...fpsSettings,
+                captureFps: isFinite(v) && v > 0 ? v : 0,
+              });
             }}
           />
         </div>
 
         <div className="chips" style={{ marginTop: 9 }}>
-          {[24, 25, 30, 60, 120, 240].map(f => (
+          <button
+            className={`chip ${!fpsSettings.captureFps ? 'is-active' : ''}`}
+            onClick={() => onUpdateFpsSettings({ ...fpsSettings, captureFps: 0 })}
+          >
+            通常
+          </button>
+          {CAPTURE_FPS_PRESETS.map(f => (
             <button
               key={f}
-              className={`chip ${Math.abs(fpsSettings.value - f) < 0.01 ? 'is-active' : ''}`}
-              onClick={() => onUpdateFpsSettings({ value: f, source: 'manual' })}
+              className={`chip ${Math.abs(fpsSettings.captureFps - f) < 0.01 ? 'is-active' : ''}`}
+              onClick={() => onUpdateFpsSettings({ ...fpsSettings, captureFps: f })}
             >
               {f}
             </button>
           ))}
-          <button
-            className={`chip ${fpsSettings.source === 'auto' ? 'is-active' : ''}`}
-            onClick={() => onUpdateFpsSettings({ ...fpsSettings, source: 'auto' })}
-          >
-            自動
-          </button>
+        </div>
+
+        <div
+          className={`notice ${isTimeScaled(fpsSettings) ? 'notice-warn' : 'notice-info'}`}
+          style={{ marginTop: 10 }}
+        >
+          時間軸: <b>{describeTimeScale(fpsSettings)}</b>
         </div>
 
         <div className="hint" style={{ marginTop: 8 }}>
-          速度計算には動画本来のタイムスタンプを直接使うため、この値がずれても速度の精度には影響しません。
-          コマ送りの刻み幅と表示に使われます。
+          240fps で撮って 30fps で書き出したスロー動画なら「撮影fps = 240」。
+          グラフと CSV の時刻・速度がこの倍率で実時間に直されます。
         </div>
       </Card>
 

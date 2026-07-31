@@ -25,18 +25,20 @@ import {
 import { recalcScale, pixelDistance } from '../utils/calibration';
 import { applyHomography, invertHomography, Matrix3 } from '../utils/homography';
 import { MIN_ROI_SIZE, RECOMMENDED_ROI_SIZE } from '../utils/tracker';
+import { stepFrames, probeFileFps, seekToFrameTime } from '../utils/videoFrame';
 import {
-  Play, Pause, RotateCcw, Upload, Hand, Square, Move, Crosshair,
+  Play, Pause, RotateCcw, Upload, Hand, Square, Move, Crosshair, Target,
   ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Route,
 } from 'lucide-react';
 
-export type StageTool = 'pan' | 'roi' | 'correct' | 'calib';
+export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin';
 
 interface VideoStageProps {
   objects: TrackedObject[];
   selectedObjId: string;
   onUpdateRoi: (id: string, roi: Rect, videoEl?: HTMLVideoElement) => void;
-  onManualCorrect: (id: string, center: Point, timestamp: number, videoEl?: HTMLVideoElement) => void;
+  /** 追跡点を手で直す。記録データを書き換えられたかを返す */
+  onManualCorrect: (id: string, center: Point, timestamp: number, videoEl?: HTMLVideoElement) => boolean;
   calibration: ScaleCalibration;
   onUpdateCalibration: (calib: ScaleCalibration) => void;
   onProcessFrame: (videoEl: HTMLVideoElement, timestamp: number, frameIndex: number) => void;
@@ -122,6 +124,16 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [dragCurrent, setDragCurrent] = useState<Point | null>(null);
   /** 2点間校正でタップ1回目を置いた位置 */
   const [linePending, setLinePending] = useState<Point | null>(null);
+  /** 修正ツールの操作結果を伝える一言（成功／記録なし） */
+  const [correctMsg, setCorrectMsg] = useState<string | null>(null);
+  /**
+   * いま表示されているフレームの実時刻（mediaTime）。
+   * 「要求した時刻」ではなくブラウザが実際に見せたフレームの時刻なので、
+   * 手動で点を打つときはこの値を記録する。
+   */
+  const frameTimeRef = useRef(0);
+  /** コマ送りの多重実行を防ぐ（連打でシークが交錯すると位置が飛ぶ） */
+  const steppingRef = useRef(false);
 
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchRef = useRef<{ dist: number; mid: { x: number; y: number } } | null>(null);
@@ -333,11 +345,61 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   }, [calibration, onUpdateCalibration]);
 
   // =========================================================
+  // 修正ツールで「掴む点」の決め方
+  // =========================================================
+  //
+  // o.center はトラッカーが最後に居た位置なので、シークで別の時刻へ移ると
+  // 画面に描かれている点とズレる。ズレたまま当たり判定に使うと掴み損ね、
+  // 意図せずパンになってしまう。
+  // そこで現在時刻に最も近い記録フレームの点を優先して掴ませる。
+
+  /** 現在の動画時刻に最も近い記録フレームの index。記録が無ければ -1 */
+  const nearestFrameIndex = useCallback((t: number): number => {
+    let best = -1;
+    let bestD = Infinity;
+    for (let i = 0; i < historyData.length; i++) {
+      const d = Math.abs(historyData[i].timestamp - t);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }, [historyData]);
+
+  /** そのオブジェクトを掴める画面上の点 */
+  const grabPoint = useCallback(
+    (o: TrackedObject, frameIdx: number): Point | null => {
+      const it = frameIdx >= 0 ? historyData[frameIdx].objects[o.id] : undefined;
+      if (it && !it.lost) return { x: it.xPx, y: it.yPx };
+      return o.center ?? null;
+    },
+    [historyData]
+  );
+
+  /** 操作結果の表示は少し経ったら消す */
+  useEffect(() => {
+    if (!correctMsg) return;
+    const id = window.setTimeout(() => setCorrectMsg(null), 2600);
+    return () => window.clearTimeout(id);
+  }, [correctMsg]);
+
+  useEffect(() => { if (tool !== 'correct') setCorrectMsg(null); }, [tool]);
+
+  // =========================================================
   // ポインタ操作
   // =========================================================
 
   const beginSingle = useCallback((pt: Point, screen: { x: number; y: number }) => {
     const hitR = HANDLE_TOUCH_PX * canvasPerScreen();
+
+    // ---- 原点指定 ----
+    // 他のどのツールよりも先に見る。1 タップで確定して移動ツールへ戻る。
+    if (tool === 'origin') {
+      onUpdateCalibration({
+        ...calibration,
+        origin: { x: Math.round(pt.x), y: Math.round(pt.y) },
+      });
+      setTool('pan');
+      return;
+    }
 
     // ---- 校正ツール ----
     if (tool === 'calib') {
@@ -376,11 +438,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     // ---- 手動修正ツール ----
     if (tool === 'correct') {
+      const v = videoRef.current;
+      const fi = nearestFrameIndex(v ? v.currentTime : 0);
       let hitId: string | null = null;
       let best = hitR * 1.5;
       objects.forEach(o => {
-        if (!o.active || !o.center || o.status === 'exited') return;
-        const d = pixelDistance(pt, o.center);
+        if (!o.active || o.status === 'exited') return;
+        const gp = grabPoint(o, fi);
+        if (!gp) return;
+        const d = pixelDistance(pt, gp);
         if (d < best) { best = d; hitId = o.id; }
       });
       if (hitId) {
@@ -388,7 +454,9 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         setDragCurrent(pt);
         return;
       }
-      // 掴めなかったらパンにフォールバック
+      // 掴めなかったらパンにフォールバックするが、
+      // 「直したつもりで何も直っていない」ことが分かるように知らせる
+      setCorrectMsg('直したい点の近くからドラッグしてください');
       setGesture({ kind: 'pan' });
       downScreenRef.current = screen;
       return;
@@ -405,7 +473,12 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     // ---- 移動ツール ----
     setGesture({ kind: 'pan' });
     downScreenRef.current = screen;
-  }, [tool, calibration, objects, canvasPerScreen, setCalibHandle, isLineCalibrating]);
+    // nearestFrameIndex / grabPoint は historyData を閉じ込んでいるので
+    // 依存に入れないと古い記録で当たり判定してしまう
+  }, [
+    tool, calibration, objects, canvasPerScreen, setCalibHandle, isLineCalibrating,
+    nearestFrameIndex, grabPoint, onUpdateCalibration, setTool,
+  ]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!videoLoaded) return;
@@ -492,7 +565,16 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (g) {
       if (g.kind === 'manual') {
         const v = videoRef.current;
-        onManualCorrect(g.objId, dragCurrent || pt, v ? v.currentTime : 0, v || undefined);
+        const applied = onManualCorrect(
+          g.objId, dragCurrent || pt, v ? v.currentTime : 0, v || undefined
+        );
+        // 書き換えられなかったことを黙って済ませない。
+        // 枠だけ動いた状態は「直ったつもりで直っていない」ので一番まずい。
+        setCorrectMsg(
+          applied
+            ? '点を修正しました'
+            : 'この時刻には記録がありません（枠のみ更新）'
+        );
       } else if (g.kind === 'roi') {
         if (isTap && dragStart) {
           // タップ: 既定サイズの正方形をその点を中心に置く
@@ -937,12 +1019,60 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       }
     }
 
+    // ----- 原点 -----
+    // 指定されているときだけ描く。未指定なら従来どおり画像の隅が原点で、
+    // そこに印を出しても情報量がないため。
+    if (calibration.origin) {
+      const o = calibration.origin;
+      const r = 13 * k;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+      ctx.lineWidth = 4.5 * k;
+      for (let pass = 0; pass < 2; pass++) {
+        ctx.beginPath();
+        ctx.moveTo(o.x - r, o.y); ctx.lineTo(o.x + r, o.y);
+        ctx.moveTo(o.x, o.y - r); ctx.lineTo(o.x, o.y + r);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(o.x, o.y, r * 0.55, 0, Math.PI * 2);
+        ctx.stroke();
+        // 1 周目は影、2 周目に本体を重ねて背景に埋もれないようにする
+        ctx.strokeStyle = '#fcd34d';
+        ctx.lineWidth = 2 * k;
+      }
+      // 軸の向きを矢印で示す（yUp かどうかが一目で分かる）
+      const up = calibration.yUp ? -1 : 1;
+      ctx.beginPath();
+      ctx.moveTo(o.x + r, o.y);
+      ctx.lineTo(o.x + r - 4.5 * k, o.y - 3.5 * k);
+      ctx.moveTo(o.x + r, o.y);
+      ctx.lineTo(o.x + r - 4.5 * k, o.y + 3.5 * k);
+      ctx.moveTo(o.x, o.y + up * r);
+      ctx.lineTo(o.x - 3.5 * k, o.y + up * (r - 4.5 * k));
+      ctx.moveTo(o.x, o.y + up * r);
+      ctx.lineTo(o.x + 3.5 * k, o.y + up * (r - 4.5 * k));
+      ctx.stroke();
+
+      ctx.font = `bold ${12 * k}px Inter, sans-serif`;
+      ctx.fillStyle = '#fcd34d';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText('原点', o.x + r + 3 * k, o.y + 3 * k);
+      ctx.restore();
+    }
+
     // ----- 修正ツールのハンドル -----
+    // 当たり判定と同じ点に出す。ここがズレていると「掴めるように見えるのに
+    // 掴めない」状態になり、原因が分からない。
     if (tool === 'correct' && !isPlaying) {
+      const vEl = videoRef.current;
+      const fi = nearestFrameIndex(vEl ? vEl.currentTime : 0);
       objects.forEach(o => {
-        if (!o.active || !o.center || o.status === 'exited') return;
+        if (!o.active || o.status === 'exited') return;
+        const gp = grabPoint(o, fi);
+        if (!gp) return;
         const dragging = gesture?.kind === 'manual' && gesture.objId === o.id;
-        const c = dragging && dragCurrent ? dragCurrent : o.center;
+        const c = dragging && dragCurrent ? dragCurrent : gp;
         ctx.beginPath();
         ctx.arc(c.x, c.y, 14 * k, 0, Math.PI * 2);
         ctx.strokeStyle = dragging ? '#fff' : o.color;
@@ -955,7 +1085,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   }, [
     historyData, objects, selectedObjId, showTrail, gesture, dragStart, dragCurrent,
     squareMode, calibration, tool, isPlaying, roiSize, linePending, calibHandle,
-    canvasPerScreen, view.z,
+    canvasPerScreen, view.z, nearestFrameIndex, grabPoint,
   ]);
 
   renderRef.current = renderFrame;
@@ -998,15 +1128,18 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             const sorted = [...arr].sort((a, b) => a - b);
             const median = sorted[Math.floor(sorted.length / 2)];
             const fps = Math.round((1 / median) * 1000) / 1000;
-            if (fps > 1 && fps < 1000 &&
-              fpsRef.current.source !== 'manual' &&
-              Math.abs(fps - fpsRef.current.value) > 0.05) {
-              setFpsRef.current({ value: fps, source: 'auto' });
+            // ファイルfps は常に自動計測で上書きする。
+            // 撮影fps（captureFps）はユーザーの入力なので保つ。
+            if (fps > 1 && fps < 1000 && Math.abs(fps - fpsRef.current.value) > 0.05) {
+              setFpsRef.current({ ...fpsRef.current, value: fps });
             }
           }
         }
       }
       lastMediaTimeRef.current = mediaTime;
+      // 再生中も「いま見えているフレームの時刻」を更新しておく。
+      // 一時停止した直後に手で点を打つとき、この値が使われる
+      frameTimeRef.current = mediaTime;
 
       processRef.current(v, mediaTime, frameCounterRef.current++);
       renderRef.current();
@@ -1070,6 +1203,30 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (videoRef.current) videoRef.current.playbackRate = playbackRate;
   }, [playbackRate]);
 
+  // 読み込み直後に一度だけ、ファイルの fps を実測する。
+  //
+  // 通常の自動計測は再生中の rVFC 間隔から行うので、
+  // 一度も再生せずにコマ送りだけする使い方（手動トラッキング）では
+  // 既定値 30 のまま走ってしまう。刻みが実フレーム間隔と合わないと、
+  // 1 回押して 2 コマ進んだり同じコマに留まったりする。
+  useEffect(() => {
+    if (!videoLoaded) return;
+    const v = videoRef.current;
+    if (!v) return;
+    let cancelled = false;
+    (async () => {
+      const fps = await probeFileFps(v);
+      if (cancelled) return;
+      if (fps && Math.abs(fps - fpsRef.current.value) > 0.05) {
+        setFpsRef.current({ ...fpsRef.current, value: fps });
+      }
+      frameTimeRef.current = v.currentTime;
+      setCurrentTime(v.currentTime);
+      renderRef.current();
+    })();
+    return () => { cancelled = true; };
+  }, [videoLoaded]);
+
   /** グラフからのシーク要求。再生中なら止めてから飛ぶ
    *  （そのまま再生を続けると、飛んだ先から重複して記録してしまう） */
   useEffect(() => {
@@ -1077,8 +1234,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (!v || !seekRequest || !videoLoaded) return;
     v.pause();
     setIsPlaying(false);
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, seekRequest.t));
-    setCurrentTime(seekRequest.t);
+    // 実際に表示されたフレームの時刻を覚えておく（要求時刻とは限らない）
+    seekToFrameTime(v, seekRequest.t).then(t => {
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seekRequest]);
 
@@ -1096,14 +1256,27 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     onClearTrail();
   };
 
-  const stepFrame = (dir: 1 | -1) => {
+  /**
+   * n コマ分だけ進む／戻る。
+   *
+   * 進んだあとに「実際に表示されたフレームの時刻」を読み直して覚えておく。
+   * fps の推定がずれていても、この値を起点に次のコマを狙うので
+   * 誤差が積み上がらない。手動トラッキングはこの時刻を記録に使う。
+   */
+  const stepFrame = useCallback(async (n: number) => {
     const v = videoRef.current;
-    if (!v || !videoLoaded) return;
+    if (!v || !videoLoaded || steppingRef.current) return;
+    steppingRef.current = true;
     v.pause();
     setIsPlaying(false);
-    const dt = 1 / (fpsSettings.value > 0 ? fpsSettings.value : 30);
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + dir * dt));
-  };
+    try {
+      const t = await stepFrames(v, fpsRef.current.value, n);
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+    } finally {
+      steppingRef.current = false;
+    }
+  }, [videoLoaded, setIsPlaying]);
 
   // =========================================================
   // 表示用の派生値
@@ -1134,9 +1307,16 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         bg: `${selected?.color || '#6366f1'}f0`, color: '#fff',
       };
     }
+    if (tool === 'origin') {
+      return {
+        text: '原点にしたい位置をタップ',
+        bg: 'rgba(245,158,11,0.95)', color: '#000',
+      };
+    }
     if (tool === 'correct') {
       return {
-        text: isPlaying ? '一時停止してから点をドラッグしてください' : 'ずれた点をドラッグして直す',
+        text: correctMsg
+          ?? (isPlaying ? '一時停止してから点をドラッグしてください' : 'ずれた点をドラッグして直す'),
         bg: 'rgba(99,102,241,0.95)', color: '#fff',
       };
     }
@@ -1188,7 +1368,12 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           onLoadedData={() => { setVideoLoaded(true); onVideoLoaded(true); drawWhenReady(); }}
           onSeeked={() => {
             const v = videoRef.current;
-            if (v) setCurrentTime(v.currentTime);
+            if (v) {
+              setCurrentTime(v.currentTime);
+              // シークバーを直接動かされた場合もここを通る。
+              // 覚えている「表示中フレームの時刻」を古いままにしない
+              frameTimeRef.current = v.currentTime;
+            }
             drawWhenReady();
           }}
           onEnded={() => setIsPlaying(false)}
@@ -1215,6 +1400,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             {toolBtn('pan', <Hand size={17} />, '移動')}
             {toolBtn('roi', <Square size={17} />, '枠を指定')}
             {toolBtn('correct', <Move size={17} />, '手動修正')}
+            {toolBtn('origin', <Target size={17} />, '原点')}
             {(isLineCalibrating || tool === 'calib') && toolBtn('calib', <Crosshair size={17} />, '校正')}
           </div>
         )}

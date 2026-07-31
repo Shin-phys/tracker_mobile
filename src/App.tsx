@@ -26,6 +26,7 @@ import { waitForOpenCV } from './utils/opencvLoader';
 import { ObjectTracker, MIN_ROI_SIZE, RECOMMENDED_ROI_SIZE } from './utils/tracker';
 import { FrameSource } from './utils/frameSource';
 import { toReal } from './utils/calibration';
+import { medianDt } from './utils/butterworth';
 
 import { TopBar } from './components/TopBar';
 import { VideoStage, StageTool } from './components/VideoStage';
@@ -34,6 +35,7 @@ import { CalibSheet } from './components/sheets/CalibSheet';
 import { TuneSheet } from './components/sheets/TuneSheet';
 import { DataSheet } from './components/sheets/DataSheet';
 import { AxisKey } from './components/MotionGraph';
+import { DEFAULT_SMOOTH_WINDOW } from './utils/graphSmooth';
 
 import { Layers, Ruler, SlidersHorizontal, LineChart, X } from 'lucide-react';
 
@@ -97,6 +99,7 @@ export const App: React.FC = () => {
     planeHeight: 21,
     homography: null,
     yUp: true,
+    origin: null,
   });
 
   const [tracking, setTracking] = useState<TrackingSettings>(DEFAULT_TRACKING);
@@ -111,7 +114,9 @@ export const App: React.FC = () => {
   });
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [fpsSettings, setFpsSettings] = useState<FpsSettings>({ value: 30, source: 'auto' });
+  // value（ファイルfps）は再生中に実フレーム間隔から自動計測して上書きされる。
+  // captureFps はユーザー入力で、0 は「通常の動画」＝時間軸の換算なし。
+  const [fpsSettings, setFpsSettings] = useState<FpsSettings>({ value: 30, captureFps: 0 });
   const [historyData, setHistoryData] = useState<FrameData[]>([]);
   const [isLineCalibrating, setIsLineCalibrating] = useState(false);
   const [videoSize, setVideoSize] = useState({ width: 0, height: 0 });
@@ -132,6 +137,11 @@ export const App: React.FC = () => {
   const [graphX, setGraphX] = useState<AxisKey>('t');
   const [graphY, setGraphY] = useState<AxisKey>('x');
   const [hiddenGraphIds, setHiddenGraphIds] = useState<string[]>([]);
+  // グラフ表示だけにかける平滑化。既定は OFF。
+  // 既定を ON にすると、追跡が飛んだ箇所が均されて見えなくなり、
+  // このモード本来の目的（計測が使い物になるかの判断）を損なうため。
+  const [graphSmooth, setGraphSmooth] = useState(false);
+  const [graphSmoothWindow, setGraphSmoothWindow] = useState(DEFAULT_SMOOTH_WINDOW);
 
   const toggleGraphId = useCallback((id: string) => {
     setHiddenGraphIds(prev =>
@@ -356,8 +366,12 @@ export const App: React.FC = () => {
   // 手動修正（キーフレーム編集）
   // -------------------------------------------------
 
+  /**
+   * @returns 記録データを実際に書き換えられたか。
+   *   false のときは枠だけが動いた状態なので、呼び出し側で知らせる必要がある。
+   */
   const handleManualCorrect = useCallback(
-    (objId: string, center: Point, timestamp: number, videoEl?: HTMLVideoElement) => {
+    (objId: string, center: Point, timestamp: number, videoEl?: HTMLVideoElement): boolean => {
       const obj = objectsRef.current.find(o => o.id === objId);
       const size = obj?.roi ? { w: obj.roi.width, h: obj.roi.height } : { w: 30, h: 30 };
       const roi: Rect = {
@@ -382,6 +396,7 @@ export const App: React.FC = () => {
         }
       }
 
+      let applied = false;
       const hist = historyDataRef.current;
       if (hist.length > 0) {
         let bestIdx = 0;
@@ -390,7 +405,14 @@ export const App: React.FC = () => {
           const d = Math.abs(hist[i].timestamp - timestamp);
           if (d < bestDiff) { bestDiff = d; bestIdx = i; }
         }
-        const tol = 1 / Math.max(1, fpsSettings.value);
+        // 許容差は「実際に記録されている間隔」から出す。
+        // 以前は 1/fpsSettings.value を使っていたが、これだと
+        // スロー動画で撮影 fps（240 など）を手入力したときに
+        // 許容差が実間隔よりずっと狭くなり、書き換えが黙って失敗していた。
+        // （最近傍フレームまでの距離は最大で間隔の半分なので 0.75 倍で足りる）
+        const recordedDt = medianDt(hist.map(f => f.timestamp));
+        const tol =
+          (recordedDt > 0 ? recordedDt : 1 / Math.max(1, fpsSettings.value)) * 0.75;
         if (bestDiff <= tol) {
           const fd = hist[bestIdx];
           const item = fd.objects[objId];
@@ -410,12 +432,15 @@ export const App: React.FC = () => {
             };
           }
           flushHistory(true);
+          applied = true;
         }
       }
 
       setObjects(prev => prev.map(o =>
         o.id === objId ? { ...o, roi, center, status: 'tracking' as ObjectStatus } : o
       ));
+
+      return applied;
     },
     [cvReady, getFrameSource, flushHistory, fpsSettings.value]
   );
@@ -712,6 +737,7 @@ export const App: React.FC = () => {
                 filterSettings={filterSettings}
                 onUpdateFilterSettings={setFilterSettings}
                 calibration={calibration}
+                fpsSettings={fpsSettings}
                 onSeek={handleSeek}
                 graphX={graphX}
                 graphY={graphY}
@@ -719,6 +745,10 @@ export const App: React.FC = () => {
                 onChangeGraphY={setGraphY}
                 hiddenGraphIds={hiddenGraphIds}
                 onToggleGraphId={toggleGraphId}
+                graphSmooth={graphSmooth}
+                graphSmoothWindow={graphSmoothWindow}
+                onChangeGraphSmooth={setGraphSmooth}
+                onChangeGraphSmoothWindow={setGraphSmoothWindow}
               />
             )}
           </div>

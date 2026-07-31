@@ -7,11 +7,15 @@
 // iOS では <a download> がファイルアプリに入らないことがあるので、
 // Web Share API が使えるときは共有シート経由も選べるようにした。
 
-import React, { useMemo, useState } from 'react';
-import { TrackedObject, FrameData, FilterSettings, ScaleCalibration } from '../../types';
+import React, { useCallback, useMemo, useState } from 'react';
+import {
+  TrackedObject, FrameData, FilterSettings, ScaleCalibration, FpsSettings,
+} from '../../types';
+import { timeScale, isTimeScaled, toFileTime } from '../../utils/timeScale';
 import { applySavitzkyGolay } from '../../utils/savitzkyGolay';
 import { autoFilter, butterworthZeroPhase, derivative, medianDt } from '../../utils/butterworth';
 import { isCalibrated } from '../../utils/calibration';
+import { smoothSeries } from '../../utils/graphSmooth';
 import { Card, Slider, Switch } from '../ui';
 import { GraphPanel } from '../GraphPanel';
 import { AxisKey } from '../MotionGraph';
@@ -26,6 +30,8 @@ interface Props {
   filterSettings: FilterSettings;
   onUpdateFilterSettings: (s: FilterSettings) => void;
   calibration: ScaleCalibration;
+  /** 時間軸の換算（スロー動画対応）に使う */
+  fpsSettings: FpsSettings;
   /** グラフをタップしたとき、その時刻へ動画をシークする */
   onSeek?: (t: number) => void;
   /** グラフの軸の選択。シートを閉じても保つよう App が持っている */
@@ -35,11 +41,19 @@ interface Props {
   onChangeGraphY: (k: AxisKey) => void;
   hiddenGraphIds: string[];
   onToggleGraphId: (id: string) => void;
+
+  /** グラフ表示だけにかける追加の平滑化（CSV には影響しない） */
+  graphSmooth: boolean;
+  graphSmoothWindow: number;
+  onChangeGraphSmooth: (on: boolean) => void;
+  onChangeGraphSmoothWindow: (w: number) => void;
 }
 
 export const DataSheet: React.FC<Props> = ({
-  objects, historyData, filterSettings, onUpdateFilterSettings, calibration, onSeek,
+  objects, historyData, filterSettings, onUpdateFilterSettings, calibration,
+  fpsSettings, onSeek,
   graphX, graphY, onChangeGraphX, onChangeGraphY, hiddenGraphIds, onToggleGraphId,
+  graphSmooth, graphSmoothWindow, onChangeGraphSmooth, onChangeGraphSmoothWindow,
 }) => {
   const activeObjects = useMemo(() => objects.filter(o => o.active), [objects]);
   const [showFilter, setShowFilter] = useState(false);
@@ -56,9 +70,14 @@ export const DataSheet: React.FC<Props> = ({
       return { processedData: historyData, report: { cutoffs, sampleRate: 0 } };
     }
 
+    // ここで時刻を実時間へ換算する。historyData 側は「ファイル上の時刻」の
+    // ままにしてあるので、撮影fps を後から直しても追跡をやり直さずに済む。
+    // 換算はこの 1 箇所だけ。以降の速度・フィルタ・グラフ・CSV は
+    // すべてこの copyData の時刻を見るので、自動的に実時間になる。
+    const scale = timeScale(fpsSettings);
     const copyData: FrameData[] = historyData.map(fd => ({
       frameIndex: fd.frameIndex,
-      timestamp: fd.timestamp,
+      timestamp: fd.timestamp * scale,
       objects: Object.fromEntries(Object.entries(fd.objects).map(([k, v]) => [k, { ...v }])),
       distances: { ...fd.distances },
     }));
@@ -126,7 +145,86 @@ export const DataSheet: React.FC<Props> = ({
     });
 
     return { processedData: copyData, report: { cutoffs, sampleRate } };
-  }, [historyData, filterSettings, activeObjects]);
+  }, [historyData, filterSettings, activeObjects, fpsSettings]);
+
+  /**
+   * グラフのタップから動画へシークするときは、実時間 → ファイル上の時刻へ
+   * 戻す必要がある。ここを忘れるとスロー動画で 8 倍ずれた位置へ飛ぶ。
+   */
+  const handleGraphSeek = useCallback(
+    (t: number) => { onSeek?.(toFileTime(t, fpsSettings)); },
+    [onSeek, fpsSettings]
+  );
+
+  /** 記録されている実時間の長さ（換算が効いているかの確認用） */
+  const realSpan = processedData.length > 1
+    ? processedData[processedData.length - 1].timestamp - processedData[0].timestamp
+    : 0;
+
+  // -------------------------------------------------
+  // グラフ表示用の追加平滑化
+  // -------------------------------------------------
+  //
+  // 位置 x, y を均し、速度は「均した位置」から中心差分で取り直す。
+  // 速度をそのまま平均すると、位置と速度が別々の量になってしまい
+  // 「この x-t の傾きがこの vx-t」という対応が崩れる。
+  //
+  // 平滑化するのはグラフに渡すデータだけで、
+  // processedData（CSV と計測値カードの元）には手を触れない。
+
+  const graphData = useMemo(() => {
+    if (!graphSmooth || graphSmoothWindow < 5 || processedData.length === 0) {
+      return processedData;
+    }
+
+    const copy: FrameData[] = processedData.map(fd => ({
+      frameIndex: fd.frameIndex,
+      timestamp: fd.timestamp,
+      objects: Object.fromEntries(
+        Object.entries(fd.objects).map(([k, v]) => [k, { ...v }])
+      ),
+      distances: { ...fd.distances },
+    }));
+
+    activeObjects.forEach(obj => {
+      // 見失った区間をまたいで均すと、追跡が飛んだ事実が消えてしまう。
+      // 連続して追跡できているフレームの塊ごとに処理する。
+      let run: number[] = [];
+
+      const flush = () => {
+        // 窓より短い塊は smoothSeries が素通しするので、そのまま渡してよい
+        if (run.length >= 3) {
+          const t = run.map(i => copy[i].timestamp);
+          const sx = smoothSeries(
+            run.map(i => copy[i].objects[obj.id].xM), graphSmoothWindow
+          );
+          const sy = smoothSeries(
+            run.map(i => copy[i].objects[obj.id].yM), graphSmoothWindow
+          );
+          const vxs = derivative(sx, t);
+          const vys = derivative(sy, t);
+          run.forEach((fi, k) => {
+            const it = copy[fi].objects[obj.id];
+            it.xM = sx[k];
+            it.yM = sy[k];
+            it.vx = vxs[k];
+            it.vy = vys[k];
+            it.speedMs = Math.hypot(vxs[k], vys[k]);
+          });
+        }
+        run = [];
+      };
+
+      for (let i = 0; i < copy.length; i++) {
+        const it = copy[i].objects[obj.id];
+        if (it && !it.lost) run.push(i);
+        else flush();
+      }
+      flush();
+    });
+
+    return copy;
+  }, [processedData, graphSmooth, graphSmoothWindow, activeObjects]);
 
   const latest = processedData.length > 0 ? processedData[processedData.length - 1] : null;
 
@@ -235,7 +333,7 @@ export const DataSheet: React.FC<Props> = ({
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <GraphPanel
             objects={objects}
-            data={processedData}
+            data={graphData}
             unit={unitLabel}
             xKey={graphX}
             yKey={graphY}
@@ -243,7 +341,11 @@ export const DataSheet: React.FC<Props> = ({
             onChangeY={onChangeGraphY}
             hiddenIds={hiddenGraphIds}
             onToggleId={onToggleGraphId}
-            onSeek={onSeek}
+            onSeek={handleGraphSeek}
+            smooth={graphSmooth}
+            smoothWindow={graphSmoothWindow}
+            onChangeSmooth={onChangeGraphSmooth}
+            onChangeSmoothWindow={onChangeGraphSmoothWindow}
             height={196}
           />
           <div className="hint">
@@ -261,6 +363,17 @@ export const DataSheet: React.FC<Props> = ({
             <div className="card__title" style={{ marginBottom: 0 }}>
               <LineChart size={16} color="var(--accent-primary)" />
               グラフ概形
+              {graphSmooth && (
+                <span className="badge" style={{ color: '#fcd34d' }}>
+                  平滑化 {graphSmoothWindow} 点
+                </span>
+              )}
+              {isTimeScaled(fpsSettings) && (
+                <span className="badge" style={{ color: '#fcd34d' }}>
+                  実時間 ×{timeScale(fpsSettings).toFixed(3)}
+                  {realSpan > 0 && ` / ${realSpan.toFixed(3)} s`}
+                </span>
+              )}
             </div>
             <button
               className="btn btn-secondary btn-icon btn-sm"
@@ -272,7 +385,7 @@ export const DataSheet: React.FC<Props> = ({
           </div>
           <GraphPanel
             objects={objects}
-            data={processedData}
+            data={graphData}
             unit={unitLabel}
             xKey={graphX}
             yKey={graphY}
@@ -280,7 +393,11 @@ export const DataSheet: React.FC<Props> = ({
             onChangeY={onChangeGraphY}
             hiddenIds={hiddenGraphIds}
             onToggleId={onToggleGraphId}
-            onSeek={onSeek}
+            onSeek={handleGraphSeek}
+            smooth={graphSmooth}
+            smoothWindow={graphSmoothWindow}
+            onChangeSmooth={onChangeGraphSmooth}
+            onChangeSmoothWindow={onChangeGraphSmoothWindow}
           />
         </div>
       )}
@@ -395,6 +512,8 @@ export const DataSheet: React.FC<Props> = ({
           {processedData.length} フレーム分 ／ BOM付きUTF-8（Excel対応）
           {calibration.mode === 'plane' && calibration.homography && ' ／ 射影変換で遠近補正済み'}
           {filterSettings.enabled && ' ／ フィルタ適用後の値'}
+          {isTimeScaled(fpsSettings) &&
+            ` ／ 撮影 ${fpsSettings.captureFps} fps として実時間に換算済み`}
         </div>
       </Card>
 

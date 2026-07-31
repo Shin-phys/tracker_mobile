@@ -7,6 +7,8 @@
 import React from 'react';
 import { TrackedObject, FrameData } from '../types';
 import { MotionGraph, AxisKey, X_AXES, Y_AXES } from './MotionGraph';
+import { SMOOTH_WINDOWS } from '../utils/graphSmooth';
+import { Switch, Slider } from './ui';
 
 interface Props {
   objects: TrackedObject[];
@@ -20,6 +22,12 @@ interface Props {
   onToggleId: (id: string) => void;
   onSeek?: (t: number) => void;
   height?: number;
+
+  /** 表示だけにかける平滑化。data は呼び出し側で平滑化済みのものが渡ってくる */
+  smooth: boolean;
+  smoothWindow: number;
+  onChangeSmooth: (on: boolean) => void;
+  onChangeSmoothWindow: (w: number) => void;
 }
 
 /** よく使う組み合わせへのショートカット */
@@ -35,9 +43,14 @@ const PRESETS: { label: string; x: AxisKey; y: AxisKey }[] = [
 export const GraphPanel: React.FC<Props> = ({
   objects, data, unit, xKey, yKey, onChangeX, onChangeY,
   hiddenIds, onToggleId, onSeek, height,
+  smooth, smoothWindow, onChangeSmooth, onChangeSmoothWindow,
 }) => {
   const active = objects.filter(o => o.active);
   const visibleIds = active.filter(o => !hiddenIds.includes(o.id)).map(o => o.id);
+
+  // スライダーは点数そのものではなく段の番号を動かす。
+  // 3→5→7… と飛び飛びの値を選ばせるため。
+  const stepIndex = Math.max(0, SMOOTH_WINDOWS.findIndex(w => w === smoothWindow));
 
   return (
     <>
@@ -83,6 +96,32 @@ export const GraphPanel: React.FC<Props> = ({
             {p.label}
           </button>
         ))}
+      </div>
+
+      {/* 表示だけの平滑化。位置を均し、速度もその位置から取り直す。
+          指で操作するので chip ではなく Switch / Slider を使う */}
+      <div className="graph-smooth">
+        <Switch
+          checked={smooth}
+          onChange={onChangeSmooth}
+          label="表示を平滑化"
+          hint={
+            smooth
+              ? 'CSV に出る値とは一致しません。追跡の飛びを探すときは OFF に'
+              : undefined
+          }
+        />
+        {smooth && (
+          <Slider
+            label="強さ"
+            value={stepIndex}
+            display={`${smoothWindow} 点`}
+            min={0}
+            max={SMOOTH_WINDOWS.length - 1}
+            step={1}
+            onChange={v => onChangeSmoothWindow(SMOOTH_WINDOWS[v])}
+          />
+        )}
       </div>
 
       <MotionGraph

@@ -19,6 +19,7 @@ import { Card } from '../ui';
 import type { StageTool } from '../VideoStage';
 import {
   Ruler, Crosshair, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ArrowUpDown,
+  Target, Eraser,
 } from 'lucide-react';
 
 interface Props {
@@ -463,6 +464,35 @@ export const CalibSheet: React.FC<Props> = ({
             Y軸を上向きにする（物理の座標系に合わせる）
           </span>
         </div>
+
+        {/* 原点。指定は映像側の「原点」ツールで行う */}
+        <div className="notice notice-info" style={{ marginTop: 10 }}>
+          原点:{' '}
+          {calibration.origin ? (
+            <b className="mono">
+              ({calibration.origin.x}, {calibration.origin.y}) px
+            </b>
+          ) : (
+            <b>画像の{calibration.yUp ? '左下' : '左上'}（既定）</b>
+          )}
+          <div style={{ marginTop: 3, opacity: 0.85, fontSize: '0.73rem' }}>
+            映像の
+            <Target size={11} style={{ verticalAlign: -1, margin: '0 2px' }} />
+            ボタンから、斜面の始点などを原点にできます。
+            CSV の x, y がその点からの値になります。
+          </div>
+        </div>
+
+        {calibration.origin && (
+          <button
+            className="btn btn-secondary btn-sm"
+            style={{ marginTop: 8, width: '100%', justifyContent: 'center' }}
+            onClick={() => onUpdateCalibration({ ...calibration, origin: null })}
+          >
+            <Eraser size={14} />
+            原点を解除（画像の隅に戻す）
+          </button>
+        )}
       </Card>
     </>
   );

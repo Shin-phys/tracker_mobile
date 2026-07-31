@@ -944,6 +944,17 @@ input[type='range']:disabled {
   font-size: 0.75rem;
 }
 
+/* 表示だけの平滑化（トグル＋強度スライダー） */
+.graph-smooth {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-subtle);
+}
+
 /* 凡例（物体の表示切替を兼ねる） */
 .legend {
   display: flex;
@@ -1006,6 +1017,7 @@ input[type='range']:disabled {
 
 .graph-full .axis-row,
 .graph-full .chips,
+.graph-full .graph-smooth,
 .graph-full .legend {
   flex-shrink: 0;
 }
