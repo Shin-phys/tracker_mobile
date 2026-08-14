@@ -25,7 +25,7 @@ import {
 import { recalcScale, pixelDistance } from '../utils/calibration';
 import { applyHomography, invertHomography, Matrix3 } from '../utils/homography';
 import { MIN_ROI_SIZE, RECOMMENDED_ROI_SIZE } from '../utils/tracker';
-import { stepFrames, probeFileFps, seekToFrameTime } from '../utils/videoFrame';
+import { stepFrames, measureFileFps, seekToFrameTime } from '../utils/videoFrame';
 import { medianDt } from '../utils/butterworth';
 import {
   nextManualTarget, countManualPoints, manualStepInterval,
@@ -63,6 +63,8 @@ interface VideoStageProps {
   isLineCalibrating: boolean;
   setIsLineCalibrating: (v: boolean) => void;
   onVideoSize: (s: { width: number; height: number }) => void;
+  /** 動画の長さ [s]。時間軸の確認表示に使う */
+  onVideoDuration?: (d: number) => void;
   onVideoLoaded: (v: boolean) => void;
   tool: StageTool;
   setTool: (t: StageTool) => void;
@@ -107,7 +109,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   calibration, onUpdateCalibration, onProcessFrame,
   historyData, onResetData, onClearTrail, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
-  onVideoSize, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
+  onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
   calibHandle, setCalibHandle, seekRequest,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -339,6 +341,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     setVideoDims({ width: v.videoWidth, height: v.videoHeight });
     onVideoSize({ width: v.videoWidth, height: v.videoHeight });
     setDuration(v.duration || 0);
+    onVideoDuration?.(v.duration || 0);
     setVideoLoaded(true);
     onVideoLoaded(true);
     try { v.currentTime = 0; } catch (_) { /* noop */ }
@@ -1282,11 +1285,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             const sorted = [...arr].sort((a, b) => a - b);
             const median = sorted[Math.floor(sorted.length / 2)];
             const fps = Math.round((1 / median) * 1000) / 1000;
-            // ファイルfps は常に自動計測で上書きする。
-            // 撮影fps（captureFps）はユーザーの入力なので保つ。
-            if (fps > 1 && fps < 1000 && Math.abs(fps - fpsRef.current.value) > 0.05) {
-              setFpsRef.current({ ...fpsRef.current, value: fps });
-            }
+            // ここでは fps を更新しない。実測で真値の半分が出たため
+            // （詳細は utils/videoFrame.ts）、読み込み時のシーク計測だけに任せる。
           }
         }
       }
@@ -1369,7 +1369,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (!v) return;
     let cancelled = false;
     (async () => {
-      const fps = await probeFileFps(v);
+      const fps = await measureFileFps(v);
       if (cancelled) return;
       if (fps && Math.abs(fps - fpsRef.current.value) > 0.05) {
         setFpsRef.current({ ...fpsRef.current, value: fps });

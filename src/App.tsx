@@ -123,6 +123,8 @@ export const App: React.FC = () => {
   const [historyData, setHistoryData] = useState<FrameData[]>([]);
   const [isLineCalibrating, setIsLineCalibrating] = useState(false);
   const [videoSize, setVideoSize] = useState({ width: 0, height: 0 });
+  /** 動画の長さ [s]。時間軸の換算が正しいかを秒数で確認するために使う */
+  const [videoDuration, setVideoDuration] = useState(0);
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -709,6 +711,7 @@ export const App: React.FC = () => {
         isLineCalibrating={isLineCalibrating}
         setIsLineCalibrating={setIsLineCalibrating}
         onVideoSize={setVideoSize}
+        onVideoDuration={setVideoDuration}
         onVideoLoaded={setVideoLoaded}
         tool={tool}
         setTool={setTool}
@@ -788,6 +791,7 @@ export const App: React.FC = () => {
               <TuneSheet
                 fpsSettings={fpsSettings}
                 onUpdateFpsSettings={setFpsSettings}
+                videoDuration={videoDuration}
                 tracking={tracking}
                 onUpdateTracking={setTracking}
                 onResetData={handleResetData}

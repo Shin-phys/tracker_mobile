@@ -7,12 +7,16 @@ import {
   FpsSettings, TrackingSettings, MarkerMode, DEFAULT_TRACKING,
 } from '../../types';
 import { Card, Slider, Switch } from '../ui';
-import { CAPTURE_FPS_PRESETS, describeTimeScale, isTimeScaled } from '../../utils/timeScale';
+import {
+  CAPTURE_FPS_PRESETS, describeTimeScale, isTimeScaled, durationCheck,
+} from '../../utils/timeScale';
 import { Timer, Settings2, RotateCcw, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface Props {
   fpsSettings: FpsSettings;
   onUpdateFpsSettings: (f: FpsSettings) => void;
+  /** 動画の長さ [s] */
+  videoDuration?: number;
   tracking: TrackingSettings;
   onUpdateTracking: (t: TrackingSettings) => void;
   onResetData: () => void;
@@ -24,7 +28,7 @@ const MARKER_MODES: { id: MarkerMode; label: string }[] = [
 ];
 
 export const TuneSheet: React.FC<Props> = ({
-  fpsSettings, onUpdateFpsSettings, tracking, onUpdateTracking, onResetData,
+  fpsSettings, onUpdateFpsSettings, videoDuration = 0, tracking, onUpdateTracking, onResetData,
 }) => {
   const [advanced, setAdvanced] = useState(false);
 
@@ -35,7 +39,8 @@ export const TuneSheet: React.FC<Props> = ({
         <div className="notice notice-info">
           ファイルのfps: <b>{fpsSettings.value.toFixed(2)} fps</b>（自動計測）
           <div style={{ marginTop: 3, opacity: 0.85 }}>
-            再生すると実フレーム間隔から自動で決まります。コマ送りの刻み幅に使われます。
+            動画を開いたときに、コマ送りして実フレーム間隔を測っています。
+            QuickTime の「エンコード FPS」と一致するはずです。
           </div>
         </div>
 
@@ -82,6 +87,21 @@ export const TuneSheet: React.FC<Props> = ({
           style={{ marginTop: 10 }}
         >
           時間軸: <b>{describeTimeScale(fpsSettings)}</b>
+          {/* 秒数でも出す。倍率だけだと、ファイルfps の計測が外れたときに
+              時間軸が黙って壊れていても気づけない */}
+          {videoDuration > 0 && (() => {
+            const d = durationCheck(videoDuration, fpsSettings);
+            return (
+              <div style={{ marginTop: 5, paddingTop: 5, borderTop: '1px solid rgba(255,255,255,0.12)' }}>
+                この動画: <span className="mono">再生 {d.playback.toFixed(2)} 秒</span>
+                {' → '}
+                <b className="mono">実時間 {d.real.toFixed(2)} 秒</b>
+                <div style={{ marginTop: 2, opacity: 0.85, fontSize: '0.73rem' }}>
+                  この秒数が実際の現象の長さと合っているか確認してください。
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         <div className="hint" style={{ marginTop: 8 }}>
