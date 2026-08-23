@@ -29,7 +29,9 @@ import { toReal } from './utils/calibration';
 import { medianDt } from './utils/butterworth';
 import {
   placeManualPoint, undoManualPoint, isFrameComplete, ManualEdit,
+  countManualPoints,
 } from './utils/manualTrack';
+import { TimeRange, FULL_RANGE, inRange, normalizeRange } from './utils/timeRange';
 
 import { TopBar } from './components/TopBar';
 import { VideoStage, StageTool } from './components/VideoStage';
@@ -61,6 +63,8 @@ const makeDefaultObjects = (): TrackedObject[] =>
     status: 'idle' as ObjectStatus,
     roi: null,
     center: null,
+    initialRoi: null,
+    initialTime: null,
   }));
 
 /** 記録データを state へ反映する最小間隔 (ms)。
@@ -121,6 +125,12 @@ export const App: React.FC = () => {
   // captureFps はユーザー入力で、0 は「通常の動画」＝時間軸の換算なし。
   const [fpsSettings, setFpsSettings] = useState<FpsSettings>({ value: 30, captureFps: 0 });
   const [historyData, setHistoryData] = useState<FrameData[]>([]);
+  /**
+   * 解析区間（始点・終点、ファイル上の時刻 [s]）。
+   * 記録と解析の両方に効く。区間外は追跡も記録もせず、終点で自動停止する。
+   * 記録済みデータのうち区間内だけをグラフ・フィルタ・CSV が使う。
+   */
+  const [timeRange, setTimeRange] = useState<TimeRange>(FULL_RANGE);
   const [isLineCalibrating, setIsLineCalibrating] = useState(false);
   const [videoSize, setVideoSize] = useState({ width: 0, height: 0 });
   /** 動画の長さ [s]。時間軸の換算が正しいかを秒数で確認するために使う */
@@ -168,6 +178,10 @@ export const App: React.FC = () => {
   trackingRef.current = tracking;
   const historyDataRef = useRef<FrameData[]>([]);
   const lastFlushRef = useRef(0);
+  // handleProcessFrame は毎フレーム呼ばれる。区間を依存に入れて作り直すと
+  // rVFC の登録がやり直しになるので、ref 経由で読む。
+  const timeRangeRef = useRef(timeRange);
+  timeRangeRef.current = timeRange;
 
   const getFrameSource = useCallback((): FrameSource => {
     if (!frameSourceRef.current) frameSourceRef.current = new FrameSource();
@@ -281,7 +295,10 @@ export const App: React.FC = () => {
     if (!inactive) return;
     setObjects(prev => prev.map(o =>
       o.id === inactive.id
-        ? { ...o, active: true, status: 'idle' as ObjectStatus, roi: null, center: null }
+        ? {
+            ...o, active: true, status: 'idle' as ObjectStatus,
+            roi: null, center: null, initialRoi: null, initialTime: null,
+          }
         : o
     ));
     setSelectedObjId(inactive.id);
@@ -296,7 +313,10 @@ export const App: React.FC = () => {
     }
     setObjects(prev => prev.map(o =>
       o.id === id
-        ? { ...o, active: false, status: 'idle' as ObjectStatus, roi: null, center: null }
+        ? {
+            ...o, active: false, status: 'idle' as ObjectStatus,
+            roi: null, center: null, initialRoi: null, initialTime: null,
+          }
         : o
     ));
     if (selectedObjId === id) {
@@ -349,7 +369,13 @@ export const App: React.FC = () => {
 
       setObjects(prev => prev.map(o =>
         o.id === objId
-          ? { ...o, roi, status: 'idle' as ObjectStatus, center }
+          ? {
+              ...o, roi, status: 'idle' as ObjectStatus, center,
+              // 引いた瞬間の枠と時刻を初期位置として覚える。
+              // やり直しはここへ戻す（roi は追跡中に上書きされるため）。
+              initialRoi: roi,
+              initialTime: videoEl ? videoEl.currentTime : null,
+            }
           : o
       ));
 
@@ -522,6 +548,10 @@ export const App: React.FC = () => {
     ));
   };
 
+  const handleChangeTimeRange = useCallback((r: TimeRange) => {
+    setTimeRange(normalizeRange(r));
+  }, []);
+
   const handleResetData = useCallback(() => {
     historyDataRef.current = [];
     lastFlushRef.current = 0;
@@ -529,18 +559,51 @@ export const App: React.FC = () => {
     Object.values(trackersRef.current).forEach(t => t.cleanup());
     trackersRef.current = {};
     setObjects(prev => prev.map(o => ({
-      ...o, status: 'idle' as ObjectStatus, roi: null, center: null,
+      ...o, status: 'idle' as ObjectStatus,
+      roi: null, center: null, initialRoi: null, initialTime: null,
     })));
   }, []);
 
-  /** 軌跡だけ消して枠は保持する（同じ設定で取り直す用） */
-  const handleClearTrail = useCallback(() => {
+  /**
+   * やり直し — 軌跡を消して、枠を「最初に引いた位置」へ戻す。
+   *
+   * roi は追跡中に毎フレーム上書きされるので、そのまま残すと
+   * 物体が最後に到達した位置の枠が残る。巻き戻して再生すると
+   * そこでテンプレートが作り直され、物体がいないので即座に破綻する。
+   * initialRoi へ戻すことで、何度でも同じ条件で取り直せる
+   * ＝ 同じ区間・同じ初期枠なら毎回同じ数値が出る。
+   *
+   * 手動で打った点も消えるので、点があるときだけ確認する。
+   *
+   * 実際に消したときだけ true を返す。呼び出し側（VideoStage）は
+   * これを見てからシークするので、確認をキャンセルすると
+   * 「データは残っているのに動画だけ始点へ飛んだ」状態にならない。
+   */
+  const handleClearTrail = useCallback((): boolean => {
+    const manualCount = countManualPoints(historyDataRef.current);
+    if (manualCount > 0) {
+      const ok = window.confirm(
+        `手動で打った点が ${manualCount} 点あります。やり直すとこれも消えます。続けますか？`
+      );
+      if (!ok) return false;
+    }
     historyDataRef.current = [];
     lastFlushRef.current = 0;
     setHistoryData([]);
     Object.values(trackersRef.current).forEach(t => t.cleanup());
     trackersRef.current = {};
-    setObjects(prev => prev.map(o => (o.roi ? { ...o, status: 'idle' as ObjectStatus } : o)));
+    setObjects(prev => prev.map(o => (
+      o.roi || o.initialRoi
+        ? {
+            ...o,
+            status: 'idle' as ObjectStatus,
+            // 初期位置を覚えていればそこへ戻す
+            roi: o.initialRoi ?? o.roi,
+            center: null,
+          }
+        : o
+    )));
+    return true;
   }, []);
 
   // -------------------------------------------------
@@ -550,6 +613,9 @@ export const App: React.FC = () => {
   const handleProcessFrame = useCallback(
     (videoEl: HTMLVideoElement, timestamp: number, frameIndex: number) => {
       if (!cvRef.current || !cvReady) return;
+      // 区間外は追跡も記録もしない。トラッカーの生成もここで止まるので、
+      // やり直したあとのテンプレートは「記録が始まる最初のコマの画」になる。
+      if (!inRange(timeRangeRef.current, timestamp)) return;
       const cv = cvRef.current;
       const cfg = trackingRef.current;
 
@@ -713,6 +779,8 @@ export const App: React.FC = () => {
         onVideoSize={setVideoSize}
         onVideoDuration={setVideoDuration}
         onVideoLoaded={setVideoLoaded}
+        timeRange={timeRange}
+        onChangeTimeRange={handleChangeTimeRange}
         tool={tool}
         setTool={setTool}
         roiSize={roiSize}
@@ -801,6 +869,7 @@ export const App: React.FC = () => {
               <DataSheet
                 objects={objects}
                 historyData={historyData}
+                timeRange={timeRange}
                 filterSettings={filterSettings}
                 onUpdateFilterSettings={setFilterSettings}
                 calibration={calibration}
