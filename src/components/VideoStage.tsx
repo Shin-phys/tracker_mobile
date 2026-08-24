@@ -32,6 +32,7 @@ import {
   recommendManualStep, MANUAL_INTERVAL_WARN,
 } from '../utils/manualTrack';
 import { timeScale } from '../utils/timeScale';
+import { drawCrosshair } from '../utils/overlay';
 import {
   TimeRange, FULL_RANGE, hasRange, rangeStart, rangeEnd, rangeSpan,
   countInRange, MIN_RANGE_POINTS,
@@ -41,7 +42,7 @@ import {
   Play, Pause, RotateCcw, Upload, Hand, Square, Move, Crosshair, Target,
   MousePointerClick, Undo2,
   ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Route,
-  Scissors, CornerDownLeft, CornerDownRight, XCircle,
+  Scissors, CornerDownLeft, CornerDownRight, XCircle, ListVideo,
 } from 'lucide-react';
 
 export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual';
@@ -63,6 +64,8 @@ interface VideoStageProps {
   onResetData: () => void;
   /** やり直し。実際に消したら true（確認をキャンセルしたら false） */
   onClearTrail: () => boolean;
+  /** 記録を即座に画面へ反映させる（全コマ処理の最後で使う） */
+  onFlushHistory?: () => void;
   isPlaying: boolean;
   setIsPlaying: (playing: boolean) => void;
   fpsSettings: FpsSettings;
@@ -98,7 +101,19 @@ const TAP_SLOP_PX = 9;
 const LOUPE_MAG = 3;
 const LOUPE_SIZE = 104;
 
-const PLAYBACK_RATES = [0.25, 0.5, 1];
+/**
+ * 再生速度。0.0625 (=1/16) は **Chrome が受け付ける下限**で、
+ * これより遅い値を代入すると NotSupportedError が飛ぶ（実測で確認）。
+ * もっと遅くしたい場面は「全コマ処理」で解決するのが筋なので、
+ * ここは下限までにとどめる。
+ */
+const PLAYBACK_RATES: { v: number; label: string }[] = [
+  { v: 0.0625, label: '1/16' },
+  { v: 0.125,  label: '1/8'  },
+  { v: 0.25,   label: '1/4'  },
+  { v: 0.5,    label: '1/2'  },
+  { v: 1,      label: '1×'   },
+];
 
 type Gesture =
   | null
@@ -117,7 +132,7 @@ interface View {
 export const VideoStage: React.FC<VideoStageProps> = ({
   objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
-  historyData, onResetData, onClearTrail, isPlaying, setIsPlaying,
+  historyData, onResetData, onClearTrail, onFlushHistory, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
   onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
   calibHandle, setCalibHandle, seekRequest,
@@ -127,6 +142,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const loupeRef = useRef<HTMLCanvasElement | null>(null);
+
+  /** 全コマ処理の実行中フラグと進捗（0〜1）、中断の合図 */
+  const [sweeping, setSweeping] = useState(false);
+  const [sweepProgress, setSweepProgress] = useState(0);
+  const sweepCancelRef = useRef(false);
 
   /**
    * 区間を rVFC のコールバックから読むための ref。
@@ -936,14 +956,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           }
         }
 
+        // 現在位置マーカー。
+        // 十字にしてあるのは、追跡点が本当に対象の上に乗っているかを
+        // 目で確かめられるようにするため。丸で塗ると対象が隠れて分からない。
         const last = points[points.length - 1];
-        ctx.beginPath();
-        ctx.arc(last.x, last.y, 4.5 * k, 0, Math.PI * 2);
-        ctx.fillStyle = obj.color;
-        ctx.fill();
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 1.5 * k;
-        ctx.stroke();
+        drawCrosshair(ctx, last.x, last.y, obj.color, k, 9, 3, 1.6);
 
         if (obj.status === 'exited') {
           ctx.beginPath();
@@ -1179,13 +1196,9 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       objects.filter(o => o.active).forEach(o => {
         const it = cur?.objects[o.id];
         if (!it || it.lost) return;
-        ctx.beginPath();
-        ctx.arc(it.xPx, it.yPx, 8 * k, 0, Math.PI * 2);
-        ctx.fillStyle = o.color;
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-        ctx.lineWidth = 2 * k;
-        ctx.stroke();
+        // 打った点は十字で示す。ここは指の狙いの精度がそのまま数値になる場所で、
+        // 塗りつぶした丸だと狙った画素が自分の描画で隠れてしまう。
+        drawCrosshair(ctx, it.xPx, it.yPx, o.color, k, 13, 3.8, 1.8);
         ctx.font = `bold ${12 * k}px Inter, sans-serif`;
         ctx.fillStyle = '#fff';
         ctx.strokeStyle = 'rgba(0,0,0,0.75)';
@@ -1251,6 +1264,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         if (!gp) return;
         const dragging = gesture?.kind === 'manual' && gesture.objId === o.id;
         const c = dragging && dragCurrent ? dragCurrent : gp;
+        // 掴める範囲を示す破線の輪
         ctx.beginPath();
         ctx.arc(c.x, c.y, 14 * k, 0, Math.PI * 2);
         ctx.strokeStyle = dragging ? '#fff' : o.color;
@@ -1258,6 +1272,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         ctx.setLineDash([4 * k, 3 * k]);
         ctx.stroke();
         ctx.setLineDash([]);
+        // 輪の中に十字。指を離す前にどの画素へ置こうとしているかが見える
+        drawCrosshair(ctx, c.x, c.y, dragging ? '#ffffff' : o.color, k, 10, 3.2, 1.6);
       });
     }
   }, [
@@ -1395,14 +1411,21 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       } catch (_) { /* シークに失敗してもそのまま再生を試みる */ }
     }
 
-    v.playbackRate = playbackRate;
+    try { v.playbackRate = playbackRate; } catch (_) { /* 非対応の速度 */ }
     v.play().then(() => setIsPlaying(true)).catch(err => {
       console.error('[VideoStage] 再生できませんでした:', err);
     });
   };
 
+  // 対応していない速度を代入すると例外が飛ぶブラウザがあるので、
+  // 必ず読み戻して UI と実際の速度をそろえる。
   useEffect(() => {
-    if (videoRef.current) videoRef.current.playbackRate = playbackRate;
+    const v = videoRef.current;
+    if (!v) return;
+    try {
+      v.playbackRate = playbackRate;
+    } catch (_) { /* 下限に丸められる。下で読み戻す */ }
+    if (Math.abs(v.playbackRate - playbackRate) > 1e-6) setPlaybackRate(v.playbackRate);
   }, [playbackRate]);
 
   // 読み込み直後に一度だけ、ファイルの fps を実測する。
@@ -1510,6 +1533,89 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   /** やり直しと、記録できない位置から再生を始めたときに戻る先 */
   const restartTime = restartTimeFor(timeRange, roiTimes);
+
+  /**
+   * 全コマ処理 — 再生せずに 1 コマずつシークして、すべてのフレームを処理する。
+   *
+   * なぜ必要か
+   *   再生しながらの処理は requestVideoFrameCallback に乗っているので、
+   *   1 フレーム分の処理が実時間のフレーム間隔に間に合わないと、
+   *   その間に提示されたコマは**呼ばれないまま通り過ぎる**。
+   *   これが「速度を落とすと追尾がうまくいく」の正体で、遅くするのは
+   *   取りこぼす確率を下げているだけで、ゼロにはならない。
+   *   端末の処理が追いつきにくいスマホでは、この差がとくに大きい。
+   *
+   *   ここでは映像を止めたまま「次のコマへシーク → 処理」を繰り返すので、
+   *   端末の速さに関係なく取りこぼしが原理的に起きない。
+   */
+  const runSweep = useCallback(async () => {
+    const v = videoRef.current;
+    if (!v || !videoLoaded || sweeping) return;
+    v.pause();
+    setIsPlaying(false);
+    sweepCancelRef.current = false;
+    setSweeping(true);
+    setSweepProgress(0);
+
+    try {
+      const fps = fpsSettings.value > 0 ? fpsSettings.value : 30;
+      const dt = 1 / fps;
+      const from = restartTime;
+      const to = rangeEnd(timeRange, duration);
+      const span = Math.max(1e-6, Math.min(to, duration || to) - from);
+
+      let t = await seekToFrameTime(v, from);
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+      processRef.current(v, t, frameCounterRef.current++);
+      renderRef.current();
+
+      // 狙う時刻（cursor）は、観測した時刻（t）とは別に持って必ず前へ進める。
+      //
+      // seekToFrameTime は、シークしても新しいコマが提示されなかった場合に
+      // 実フレーム時刻ではなく「要求した時刻」を返すことがある
+      // （requestVideoFrameCallback が発火しないときのフォールバック）。
+      // その値をそのまま次の起点にすると、狙いがコマ境界からずれて、
+      // やがて前のコマへ戻ってしまい途中で止まる（実測で 30 コマ目で停止した）。
+      let cursor = t;
+      let stall = 0;
+      let guard = 0;
+      while (!sweepCancelRef.current && guard < 20000) {
+        guard++;
+        cursor = Math.max(cursor, t) + dt;
+        if (cursor > to + dt) break;             // 区間の終点を越えた
+        // 境界ぴったりを狙うと丸めで同じコマに留まるので 1/4 コマ足す
+        // 猶予を長めに取る。ここは対話ではないので待てるし、
+        // 待ち切れないと記録される時刻が 1 コマ未満ずれる
+        let got = await seekToFrameTime(v, cursor + dt * 0.25, 600, 220);
+        if (!(got > t + dt * 0.2)) {
+          // 新しいコマが提示されなかった。もう半コマ押して一度だけ試す。
+          // ここで諦めるとそのコマを 1 枚落とすことになる
+          got = await seekToFrameTime(v, cursor + dt * 0.6, 600, 220);
+        }
+        if (got > t + dt * 0.2) {
+          t = got;
+          stall = 0;
+          if (t > to + 1e-9) break;
+          frameTimeRef.current = t;
+          setCurrentTime(t);
+          processRef.current(v, t, frameCounterRef.current++);
+          renderRef.current();
+          setSweepProgress(Math.min(1, (t - from) / span));
+        } else if (++stall >= 3) {
+          break;   // 3 回続けて新しいコマが出てこない＝本当に末尾
+        }
+      }
+    } catch (err) {
+      console.error('[VideoStage] 全コマ処理でエラー:', err);
+    } finally {
+      setSweeping(false);
+      setSweepProgress(0);
+      // 最後の数コマは間引きの都合で未反映のことがあるので、明示的に確定させる
+      onFlushHistory?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoLoaded, sweeping, fpsSettings.value, duration, restartTime, timeRange]);
 
   /** 「いま画面に出ているフレーム」の時刻。要求時刻ではなく実際の mediaTime */
   const shownTime = () => frameTimeRef.current || currentTime;
@@ -1752,19 +1858,31 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             <ChevronRight size={17} />
           </button>
           <button className="btn btn-secondary btn-icon btn-sm" onClick={handleRestart}
-            disabled={!videoLoaded} aria-label="軌跡を消し、枠を最初に置いた位置へ戻して、記録が始まる時刻へ送る">
+            disabled={!videoLoaded || sweeping}
+            aria-label="軌跡を消し、枠を最初に置いた位置へ戻して、記録が始まる時刻へ送る">
             <RotateCcw size={16} />
+          </button>
+
+          <button
+            className={`btn btn-sm ${sweeping ? 'btn-warning' : 'btn-secondary'}`}
+            onClick={() => { if (sweeping) sweepCancelRef.current = true; else runSweep(); }}
+            disabled={!videoLoaded || isPlaying}
+            style={{ fontSize: '0.72rem' }}
+            aria-label="再生せずに 1 コマずつ処理する。端末の速さに関係なく取りこぼしが起きない">
+            <ListVideo size={14} />
+            {sweeping ? `中止 ${Math.round(sweepProgress * 100)}%` : '全コマ'}
           </button>
 
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
             {PLAYBACK_RATES.map(r => (
               <button
-                key={r}
-                className={`chip ${playbackRate === r ? 'is-active' : ''}`}
+                key={r.v}
+                className={`chip ${Math.abs(playbackRate - r.v) < 1e-6 ? 'is-active' : ''}`}
                 style={{ minHeight: 34, padding: '4px 9px', fontSize: '0.72rem' }}
-                onClick={() => setPlaybackRate(r)}
+                onClick={() => setPlaybackRate(r.v)}
+                disabled={sweeping}
               >
-                {r}×
+                {r.label}
               </button>
             ))}
           </div>
@@ -1843,6 +1961,26 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             </button>
             <span className="mono" style={{ fontSize: '0.72rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
               {countManualPoints(historyData)} 点
+            </span>
+          </div>
+        )}
+
+        {sweeping && (
+          <div className="playbar__row" style={{ gap: 8 }}>
+            <span style={{ fontSize: '0.74rem', color: '#fcd34d', fontWeight: 700, flexShrink: 0 }}>
+              全コマ処理中
+            </span>
+            <div style={{
+              flex: 1, height: 6, borderRadius: 3, overflow: 'hidden',
+              background: 'rgba(255,255,255,0.10)',
+            }}>
+              <div style={{
+                width: `${Math.round(sweepProgress * 100)}%`, height: '100%',
+                background: '#f59e0b', transition: 'width 120ms linear',
+              }} />
+            </div>
+            <span className="mono" style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+              {Math.round(sweepProgress * 100)}%
             </span>
           </div>
         )}

@@ -16,7 +16,7 @@ import {
   applySavitzkyGolay, sgWindowSeconds, recommendSgWindow, SG_WINDOW_WARN_SEC,
 } from '../../utils/savitzkyGolay';
 import { autoFilter, butterworthZeroPhase, derivative, medianDt } from '../../utils/butterworth';
-import { isCalibrated } from '../../utils/calibration';
+import { outputUnit } from '../../utils/calibration';
 import { smoothSeries } from '../../utils/graphSmooth';
 import {
   TimeRange, clipToRange, hasRange, MIN_RANGE_POINTS,
@@ -79,7 +79,8 @@ export const DataSheet: React.FC<Props> = ({
 
   const activeObjects = useMemo(() => objects.filter(o => o.active), [objects]);
   const [showFilter, setShowFilter] = useState(false);
-  const unitLabel = isCalibrated(calibration) ? calibration.unit : 'px';
+  // 出力は m に統一する（校正の入力単位が cm でも、記録される値は m）
+  const unitLabel = outputUnit(calibration);
   const [graphFull, setGraphFull] = useState(false);
 
   // -------------------------------------------------
@@ -255,7 +256,7 @@ export const DataSheet: React.FC<Props> = ({
   // -------------------------------------------------
 
   const buildCsv = (): string => {
-    const u = isCalibrated(calibration) ? calibration.unit : 'px';
+    const u = outputUnit(calibration);
     const headers: string[] = ['Timestamp(s)'];
 
     activeObjects.forEach(obj => {
@@ -315,6 +316,68 @@ export const DataSheet: React.FC<Props> = ({
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // -------------------------------------------------
+  // 位置だけの CSV（平滑化前の生の値）
+  // -------------------------------------------------
+  //
+  // 速度を自分で求める過程そのものが学習の中身なので、速度も加速度も出さない。
+  // 平滑化もかけない。平滑化後の位置を渡すと、そこから求めた速度は
+  // 「こちらのフィルタの結果」を引き継いだものになり、差分を取るとなぜノイズが
+  // 荒れるのか、なぜ平滑化が要るのかを手を動かして確かめられなくなる。
+  // そのぶん、この値は画面のグラフとは一致しない。
+
+  const buildPositionCsv = (): string => {
+    const scale = timeScale(fpsSettings);
+    const u = outputUnit(calibration);
+    const headers = [
+      'Timestamp(s)',
+      ...activeObjects.flatMap(o => [`${o.id}_X(${u})`, `${o.id}_Y(${u})`]),
+    ];
+    const rows: string[] = [headers.join(',')];
+    historyData.forEach(fd => {
+      const row: string[] = [(fd.timestamp * scale).toFixed(6)];
+      activeObjects.forEach(o => {
+        const it = fd.objects[o.id];
+        // 見失ったコマは空欄にする。0 を入れると原点に居たように読めてしまう
+        if (!it || it.lost) row.push('', '');
+        else row.push(it.xM.toFixed(6), it.yM.toFixed(6));
+      });
+      rows.push(row.join(','));
+    });
+    return '\uFEFF' + rows.join('\n');
+  };
+
+  const positionFileName = () =>
+    `motion_position_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+
+  const downloadPositionCSV = () => {
+    if (historyData.length === 0) return;
+    const blob = new Blob([buildPositionCsv()], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = positionFileName();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const sharePositionCSV = async () => {
+    if (historyData.length === 0) return;
+    try {
+      const file = new File([buildPositionCsv()], positionFileName(), { type: 'text/csv' });
+      const nav = navigator as any;
+      if (nav.canShare?.({ files: [file] })) {
+        await nav.share({ files: [file], title: 'MotionTrace 位置データ' });
+        return;
+      }
+    } catch (err) {
+      console.warn('[DataSheet] 共有できませんでした:', err);
+    }
+    downloadPositionCSV();
   };
 
   /** 共有シート経由でファイルを渡す（iOS ではこちらの方が確実） */
@@ -564,6 +627,41 @@ export const DataSheet: React.FC<Props> = ({
             </button>
           )}
         </div>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+          <button
+            className="btn btn-secondary"
+            style={{ flex: 1, fontSize: '0.82rem' }}
+            onClick={downloadPositionCSV}
+            disabled={historyData.length === 0}
+          >
+            <Download size={16} />位置だけの CSV
+          </button>
+          {canShare && (
+            <button
+              className="btn btn-secondary"
+              onClick={sharePositionCSV}
+              disabled={historyData.length === 0}
+              aria-label="位置だけの CSV を共有"
+            >
+              <Share2 size={16} />
+            </button>
+          )}
+        </div>
+        <div
+          className="hint"
+          style={{
+            marginTop: 8, padding: '9px 11px', borderRadius: 10, lineHeight: 1.7,
+            background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.22)',
+          }}
+        >
+          <b>位置だけの CSV</b> は<b>時刻と x, y だけ</b>を出します。速度も加速度も
+          入っていないので、表計算で自分で求められます。
+          <b style={{ color: '#fcd34d' }}> 平滑化はかけていません。</b>
+          差分を取るとノイズがどれだけ荒れるか、なぜ平滑化が要るのかを、
+          そのまま確かめられるようにするためです。そのぶん、この値は
+          グラフや通常の CSV とは一致しません。
+        </div>
+
         <div className="hint" style={{ marginTop: 8 }}>
           {processedData.length} フレーム分 ／ BOM付きUTF-8（Excel対応）
           {hasRange(timeRange) &&
