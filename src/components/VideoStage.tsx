@@ -63,7 +63,9 @@ interface VideoStageProps {
   historyData: FrameData[];
   onResetData: () => void;
   /** やり直し。実際に消したら true（確認をキャンセルしたら false） */
-  onClearTrail: () => boolean;
+  /** やり直し。引数は「戻る先の時刻」。軌跡が残っていれば、そのコマで
+   *  物体がいた位置へ枠を戻すのに使う。実際に消したら true */
+  onClearTrail: (restartAt?: number | null) => boolean;
   /** 記録を即座に画面へ反映させる（全コマ処理の最後で使う） */
   onFlushHistory?: () => void;
   isPlaying: boolean;
@@ -1474,7 +1476,10 @@ export const VideoStage: React.FC<VideoStageProps> = ({
    * 枠を置いたコマより前へ戻しても、そのコマに物体がいないので
    * テンプレートが作れず、追跡が始まらないため。
    *
-   * 枠を初期位置へ戻すのは onClearTrail（App 側）が行う。
+   * 枠を戻すのは onClearTrail（App 側）が行う。戻る先の時刻を渡すのは、
+   * 直前の軌跡が残っていれば「そのコマで物体がいた位置」へ枠を戻せるため。
+   * 区間の始点を後から動かしたときに、枠だけが最初に引いた場所へ取り残されて
+   * 「やり直すたびに枠を置き直す」ことになるのを防ぐ。
    */
   const handleRestart = async () => {
     const v = videoRef.current;
@@ -1483,7 +1488,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     // 先に消す。手動点の確認でキャンセルされたら、動画は動かさない
     // （データが残ったまま始点へ飛ぶと、何が起きたのか分からなくなる）。
-    if (!onClearTrail()) return;
+    if (!onClearTrail(restartTime)) return;
 
     if (v) {
       const st = restartTime;
@@ -1859,7 +1864,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           </button>
           <button className="btn btn-secondary btn-icon btn-sm" onClick={handleRestart}
             disabled={!videoLoaded || sweeping}
-            aria-label="軌跡を消し、枠を最初に置いた位置へ戻して、記録が始まる時刻へ送る">
+            aria-label="軌跡を消し、枠を戻る先のコマの位置へ戻して、記録が始まる時刻へ送る">
             <RotateCcw size={16} />
           </button>
 
@@ -2114,7 +2119,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
                 <>区間外は追跡も記録もしません。終点で自動停止します。
                   グラフ・CSV もこの区間だけを使います。
                   {historyData.length > 0 &&
-                    ' 取り直すときは、やり直しボタンを押してください（軌跡を消し、枠を最初の位置へ戻して始点へ送ります）。'}</>
+                    ' 取り直すときは、やり直しボタンを押してください（軌跡を消し、枠を始点のコマの位置へ戻して始点へ送ります）。'}</>
               ) : (
                 <>頭の準備時間や着地後の跳ね返りを外すと、フィルタの自動遮断周波数が
                   運動区間だけを見るようになり、数値が安定します（任意）。

@@ -183,7 +183,7 @@ export const TuneSheet: React.FC<Props> = ({
               display={`${tracking.searchScale.toFixed(1)}×`}
               min={0.6} max={4} step={0.2}
               onChange={v => onUpdateTracking({ ...tracking, searchScale: v })}
-              hint="速く動く対象では大きめに。大きいほど処理は重くなります（スマホでは 1.8 前後を推奨）"
+              hint="速く動く対象では大きめに。大きいほど処理は重くなります（既定 1.2×。見失うときだけ上げてください）"
             />
 
             <Switch
@@ -218,7 +218,7 @@ export const TuneSheet: React.FC<Props> = ({
           <Eraser size={16} />枠と記録をすべて消去
         </button>
         <div className="hint" style={{ marginTop: 8 }}>
-          軌跡だけ消して枠を残したいときは、再生バーの「先頭へ戻す」を使ってください。
+          軌跡だけ消して枠を残したいときは、再生バーの「やり直し」（↺）を使ってください。
         </div>
       </Card>
     </>
