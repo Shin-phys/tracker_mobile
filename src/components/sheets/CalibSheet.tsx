@@ -417,7 +417,7 @@ export const CalibSheet: React.FC<Props> = ({
             <span />
           </div>
           <div className="hint" style={{ marginTop: 8, textAlign: 'center' }}>
-            選んだ点が映像上で白く太く表示されます
+            選んだ点は映像上で太い十字になります（中心は塗らないので、狙っている画素が見えます）
           </div>
         </Card>
       )}

@@ -936,6 +936,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     // ズームしているときは細く描かないと、拡大時に線が対象を覆い隠す。
     const k = Math.max(0.6, (vw / 960) / Math.max(1, view.z * 0.7));
 
+    // いま校正を触っているか。層の出し分けに使う。
+    // 枠・名前・校正点・校正の数値が同じ場所に重なると、どれを操作して
+    // いるのか分からなくなる。操作中の層だけを濃くするのが確実に効く。
+    const calibActive = tool === 'calib' || tool === 'origin';
+
     // ----- 軌跡 -----
     if (showTrail && historyData.length > 1) {
       objects.forEach(obj => {
@@ -1033,21 +1038,32 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       const color = isLost ? '#ef4444' : obj.color;
 
       ctx.save();
+      // 校正中は追跡の層を薄くする
+      if (calibActive) ctx.globalAlpha = 0.28;
       ctx.strokeStyle = color;
       ctx.lineWidth = (isSel ? 2.5 : 1.5) * k;
       ctx.setLineDash(isLost ? [6 * k, 4 * k] : []);
       ctx.strokeRect(x, y, width, height);
-      ctx.restore();
+      ctx.setLineDash([]);
 
-      const label = isLost ? `${obj.id} LOST` : obj.id;
-      ctx.font = `bold ${11 * k}px Inter, sans-serif`;
-      const tw = ctx.measureText(label).width;
-      const lh = 19 * k;
-      const ly = Math.max(0, y - lh - 3 * k);
-      ctx.fillStyle = color;
-      ctx.fillRect(x, ly, tw + 12 * k, lh);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(label, x + 6 * k, ly + 13.5 * k);
+      // 名前を出すのは選択中と LOST のときだけ。
+      // 帯は枠と同じ幅を占めるので、全部に出すと枠の上が名前で埋まる。
+      if (isSel || isLost) {
+        const label = isLost ? `${obj.id} LOST` : obj.id;
+        ctx.font = `bold ${11 * k}px Inter, sans-serif`;
+        const tw = ctx.measureText(label).width;
+        const lh = 19 * k;
+        const ly = Math.max(0, y - lh - 3 * k);
+        ctx.fillStyle = color;
+        ctx.fillRect(x, ly, tw + 12 * k, lh);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, x + 6 * k, ly + 13.5 * k);
+      } else {
+        // 非選択は角の小さな印だけ。色で見分けられれば足りる
+        const sq = 7 * k;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, Math.max(0, y - sq - 2 * k), sq, sq);
+      }
 
       const c = obj.center || { x: x + width / 2, y: y + height / 2 };
       ctx.beginPath();
@@ -1056,6 +1072,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       ctx.strokeStyle = '#fff';
       ctx.lineWidth = 1.2 * k;
       ctx.stroke();
+      ctx.restore();
     });
 
     // ----- 枠ドラッグ中のプレビュー -----
@@ -1104,13 +1121,16 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     // ----- 2点間校正 -----
     const drawLine = (p1: Point, p2: Point, live: boolean) => {
+      // 校正が済んだあとは控えめにする。値は一度決まれば変わらないので、
+      // 映像の上に居座る必要がない（数値は校正シートに常時出ている）。
+      const focus = live || calibActive;
       const dist = pixelDistance(p1, p2);
       ctx.save();
       ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-      ctx.lineWidth = 5 * k;
+      ctx.lineWidth = (focus ? 5 : 3) * k;
       ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
-      ctx.strokeStyle = live ? '#fbbf24' : '#f59e0b';
-      ctx.lineWidth = 2.5 * k;
+      ctx.strokeStyle = live ? '#fbbf24' : focus ? '#f59e0b' : 'rgba(245,158,11,0.6)';
+      ctx.lineWidth = (focus ? 2.5 : 1.4) * k;
       ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
       // 中を塗らない。塗ると狙っている目盛りが自分の描画で隠れ、
       // 終点を目分量で置くことになる（それが縮尺の誤差として残る）
@@ -1118,15 +1138,31 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         const focused = tool === 'calib' && calibHandle === i;
         drawCalibPoint(ctx, p.x, p.y, i === 0 ? '#f59e0b' : '#10b981', k, focused);
       });
-      const mx = (p1.x + p2.x) / 2;
-      const my = (p1.y + p2.y) / 2;
-      const label = `${dist.toFixed(1)}px = ${calibration.realSizeValue}${calibration.unit}`;
-      ctx.font = `bold ${12 * k}px JetBrains Mono, monospace`;
-      const tw = ctx.measureText(label).width;
-      ctx.fillStyle = 'rgba(0,0,0,0.8)';
-      ctx.fillRect(mx - tw / 2 - 7 * k, my - 27 * k, tw + 14 * k, 21 * k);
-      ctx.fillStyle = '#fbbf24';
-      ctx.fillText(label, mx - tw / 2, my - 12 * k);
+      // 数値は、製図の寸法線と同じように線から垂直へ逃がす。
+      // 基準が短いとき、線の真上に置くと狙っている対象を数値で隠してしまう。
+      if (focus) {
+        const mx = (p1.x + p2.x) / 2;
+        const my = (p1.y + p2.y) / 2;
+        const len = Math.max(1, dist);
+        let nx = -(p2.y - p1.y) / len;
+        let ny = (p2.x - p1.x) / len;
+        if (ny > 0) { nx = -nx; ny = -ny; }   // なるべく上へ逃がす
+        const lx = mx + nx * 32 * k;
+        const ly = my + ny * 32 * k;
+        ctx.beginPath();
+        ctx.moveTo(mx, my); ctx.lineTo(lx, ly);
+        ctx.strokeStyle = 'rgba(251,191,36,0.65)';
+        ctx.lineWidth = 1 * k;
+        ctx.stroke();
+
+        const label = `${dist.toFixed(1)}px = ${calibration.realSizeValue}${calibration.unit}`;
+        ctx.font = `bold ${12 * k}px JetBrains Mono, monospace`;
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(lx - tw / 2 - 7 * k, ly - 10.5 * k, tw + 14 * k, 21 * k);
+        ctx.fillStyle = '#fbbf24';
+        ctx.fillText(label, lx - tw / 2, ly + 4 * k);
+      }
       ctx.restore();
     };
 
