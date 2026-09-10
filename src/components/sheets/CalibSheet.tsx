@@ -14,6 +14,7 @@ import {
 import {
   recalcScale, convertValue, pixelDistance, fmt,
   isCalibrated as calibDone, scaleVariation,
+  calibrationAdvice, calibrationGrade, referenceLengthPx,
 } from '../../utils/calibration';
 import { Card } from '../ui';
 import type { StageTool } from '../VideoStage';
@@ -447,6 +448,26 @@ export const CalibSheet: React.FC<Props> = ({
           </>
         )}
       </div>
+
+      {/* ---- 基準の短さの警告 ---- */}
+      {/* 基準が短いと、その 1px がそのまま長さ・速度・加速度の誤差になる。
+          黙って通り過ぎるといちばん気づけないので、ここで必ず出す。 */}
+      {calibrationAdvice(calibration) && (
+        <div
+          className="notice notice-warn"
+          style={{
+            flexDirection: 'column', alignItems: 'stretch', gap: 3,
+            ...(calibrationGrade(calibration) === 'poor'
+              ? { borderColor: 'rgba(239,68,68,0.45)', color: '#fca5a5' }
+              : null),
+          }}
+        >
+          <span>⚠ {calibrationAdvice(calibration)}</span>
+          <span style={{ opacity: 0.8, fontSize: '0.73rem' }}>
+            いまの基準: <span className="mono">{referenceLengthPx(calibration).toFixed(1)} px</span>
+          </span>
+        </div>
+      )}
 
       {/* ---- 座標系 ---- */}
       <Card>
