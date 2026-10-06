@@ -9,7 +9,7 @@ import { RECOMMENDED_ROI_SIZE } from '../../utils/tracker';
 import { Card } from '../ui';
 import type { StageTool } from '../VideoStage';
 import {
-  Plus, Trash2, RefreshCw, AlertTriangle, LogOut, CheckCircle, Square, Layers,
+  Plus, Trash2, RefreshCw, AlertTriangle, LogOut, CheckCircle, Square, Layers, Zap,
 } from 'lucide-react';
 
 interface Props {
@@ -33,6 +33,7 @@ export const ObjectsSheet: React.FC<Props> = ({
   const lost = active.filter(o => o.status === 'lost');
   const exited = active.filter(o => o.status === 'exited');
   const attention = [...lost, ...exited];
+  const selected = objects.find(o => o.id === selectedObjId);
 
   return (
     <>
@@ -72,6 +73,21 @@ export const ObjectsSheet: React.FC<Props> = ({
           <Square size={16} />
           映像で {selectedObjId} の枠を置く
         </button>
+
+        {/* 速い対象向け。枠を置いたコマから数コマ送って、もう一度指してもらう。
+            トラッカーは最初の 1 コマだけ速度を持たないので、1 コマの移動量が
+            探索窓を超える対象は、そこで必ず破綻する。 */}
+        {selected?.initialRoi && (
+          <button
+            className="btn btn-secondary"
+            style={{ width: '100%', marginTop: 8 }}
+            disabled={!videoLoaded}
+            onClick={() => setTool('seed')}
+          >
+            <Zap size={15} />
+            速い対象: 数コマ先でもう一度指す
+          </button>
+        )}
 
         <div style={{ marginTop: 12 }}>
           <div className="row-between" style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>

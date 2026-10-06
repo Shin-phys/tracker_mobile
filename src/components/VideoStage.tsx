@@ -33,6 +33,7 @@ import {
 } from '../utils/manualTrack';
 import { timeScale } from '../utils/timeScale';
 import { drawCrosshair, drawCalibPoint } from '../utils/overlay';
+import { SEED_FRAMES } from '../types';
 import { checkTrack } from '../utils/frameCheck';
 import {
   TimeRange, FULL_RANGE, hasRange, rangeStart, rangeEnd, rangeSpan,
@@ -46,7 +47,7 @@ import {
   Scissors, CornerDownLeft, CornerDownRight, XCircle, ListVideo,
 } from 'lucide-react';
 
-export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual';
+export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual' | 'seed';
 
 interface VideoStageProps {
   objects: TrackedObject[];
@@ -58,6 +59,8 @@ interface VideoStageProps {
   onManualPlace: (id: string, center: Point, fileTime: number) => boolean;
   /** 手動トラッキングの直前の 1 点を取り消す */
   onManualUndo: () => boolean;
+  /** 初速ヒント。数コマ先で対象を指す。戻り値は画面に出す一言（空なら何も言わない） */
+  onSeedPoint: (objId: string, point: Point, fileTime: number) => string;
   calibration: ScaleCalibration;
   onUpdateCalibration: (calib: ScaleCalibration) => void;
   onProcessFrame: (videoEl: HTMLVideoElement, timestamp: number, frameIndex: number) => void;
@@ -135,6 +138,7 @@ interface View {
 export const VideoStage: React.FC<VideoStageProps> = ({
   objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
+  onSeedPoint,
   historyData, onResetData, onClearTrail, onFlushHistory, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
   onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
@@ -181,6 +185,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [linePending, setLinePending] = useState<Point | null>(null);
   /** 修正ツールの操作結果を伝える一言（成功／記録なし） */
   const [correctMsg, setCorrectMsg] = useState<string | null>(null);
+  /** 初速ヒントの結果の一言。普段は null（黙っている） */
+  const [seedMsg, setSeedMsg] = useState<string | null>(null);
   /**
    * いま表示されているフレームの実時刻（mediaTime）。
    * 「要求した時刻」ではなくブラウザが実際に見せたフレームの時刻なので、
@@ -453,6 +459,32 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   useEffect(() => { if (tool !== 'correct') setCorrectMsg(null); }, [tool]);
 
+  /** 初速ヒントの一言も、少し経ったら消す（警告は長めに出す） */
+  useEffect(() => {
+    if (!seedMsg) return;
+    const id = window.setTimeout(() => setSeedMsg(null), 7000);
+    return () => window.clearTimeout(id);
+  }, [seedMsg]);
+
+  /**
+   * 初速ヒントに入ったら、枠を置いたコマから数コマ送る。
+   * 2 点が近すぎると、1 コマあたりの移動量の精度が出ないため。
+   */
+  useEffect(() => {
+    if (tool !== 'seed') return;
+    const v = videoRef.current;
+    const o = objects.find(x => x.id === selectedObjId);
+    if (!v || !o || o.initialTime === null) return;
+    v.pause();
+    setIsPlaying(false);
+    const target = o.initialTime + SEED_FRAMES / Math.max(1, fpsRef.current.value);
+    seekToFrameTime(v, target).then(t => {
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+    }).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool]);
+
   /**
    * n コマ分だけ進む／戻る。
    *
@@ -563,6 +595,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         bg: 'rgba(10,132,255,0.95)', color: '#fff',
       };
     }
+    // ---- 初速ヒント ----
+    // 1 タップで確定して自分で抜ける
+    if (tool === 'seed') {
+      const msg = onSeedPoint(selectedObjId, pt, frameTimeRef.current);
+      setSeedMsg(msg || null);
+      setTool('pan');
+      return;
+    }
+
     if (tool === 'origin') {
       onUpdateCalibration({
         ...calibration,
@@ -1072,6 +1113,31 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       ctx.strokeStyle = '#fff';
       ctx.lineWidth = 1.2 * k;
       ctx.stroke();
+      ctx.restore();
+    });
+
+    // ----- 初速ヒント -----
+    // 指した点と枠を置いた位置を結んでおく。これが「1 コマあたりどれだけ
+    // 動くか」の根拠なので、見えていないと置き直しの判断ができない。
+    objects.forEach(obj => {
+      if (!obj.active || !obj.seed || obj.id !== selectedObjId) return;
+      ctx.save();
+      ctx.globalAlpha = 0.75;
+      if (obj.initialRoi) {
+        const from = {
+          x: obj.initialRoi.x + obj.initialRoi.width / 2,
+          y: obj.initialRoi.y + obj.initialRoi.height / 2,
+        };
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(obj.seed.point.x, obj.seed.point.y);
+        ctx.strokeStyle = obj.color;
+        ctx.lineWidth = 1.2 * k;
+        ctx.setLineDash([5 * k, 4 * k]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      drawCrosshair(ctx, obj.seed.point.x, obj.seed.point.y, obj.color, k, 9, 2.4, 1.3);
       ctx.restore();
     });
 
@@ -1743,6 +1809,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         text: `${selectedObjId} の枠 — 対象をタップ（または囲んでドラッグ）`,
         bg: `${selected?.color || '#6366f1'}f0`, color: '#fff',
       };
+    }
+    if (tool === 'seed') {
+      return {
+        text: `${selectedObjId} が移動した先をタップ`,
+        bg: 'rgba(245,158,11,0.95)', color: '#000',
+      };
+    }
+    if (seedMsg) {
+      return { text: `⚠ ${seedMsg}`, bg: 'rgba(239,68,68,0.95)', color: '#fff' };
     }
     if (tool === 'origin') {
       return {
