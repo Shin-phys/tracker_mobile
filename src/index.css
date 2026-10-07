@@ -221,6 +221,24 @@ body {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.55);
 }
 
+/* 枠の大きさを決めるパネル。中心を決めたあとに出る */
+.stage__sizebar {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  width: min(300px, calc(100% - 28px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(8, 13, 26, 0.93);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+  z-index: 7;
+}
+
 /* 指で隠れる位置を拡大表示する虫めがね */
 .loupe {
   position: absolute;

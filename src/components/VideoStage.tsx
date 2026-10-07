@@ -128,6 +128,7 @@ type Gesture =
   | null
   | { kind: 'pan' }
   | { kind: 'roi' }
+  | { kind: 'seed' }
   | { kind: 'manual'; objId: string }
   | { kind: 'calib-new' }
   | { kind: 'calib-handle'; index: number };
@@ -172,7 +173,6 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [duration, setDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [showTrail, setShowTrail] = useState(true);
-  const [squareMode] = useState(true);
 
   /** ステージ（表示領域）の実サイズ */
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
@@ -192,6 +192,14 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [seedMsg, setSeedMsg] = useState<string | null>(null);
   /** 注意書きを開いているか。既定は畳む */
   const [alertsOpen, setAlertsOpen] = useState(false);
+  /**
+   * 枠を置くときの中心。決まっていれば「大きさを決める段階」。
+   *
+   * 1 回のドラッグで中心と大きさを同時に決めさせると、指ではどちらも
+   * 精度が出ない。中心だけ拡大鏡で合わせ、大きさはあとから落ち着いて
+   * 決める、の 2 段階に分けている。
+   */
+  const [roiCenter, setRoiCenter] = useState<Point | null>(null);
   /**
    * いま表示されているフレームの実時刻（mediaTime）。
    * 「要求した時刻」ではなくブラウザが実際に見せたフレームの時刻なので、
@@ -463,6 +471,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   }, [correctMsg]);
 
   useEffect(() => { if (tool !== 'correct') setCorrectMsg(null); }, [tool]);
+  useEffect(() => { if (tool !== 'roi') setRoiCenter(null); }, [tool]);
 
   /** 初速ヒントの一言も、少し経ったら消す（警告は長めに出す） */
   useEffect(() => {
@@ -617,14 +626,13 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       };
     }
     // ---- 初速ヒント ----
-    // 1 タップで確定して自分で抜ける
+    // 始点は枠の中心で決まっているので、指を置いた瞬間に矢印が生えて、
+    // 動かすと先端が追従する。離した位置が「数コマ先の対象の位置」。
+    // 何を教えているのかが見えるぶん、ただのタップより迷わない。
     if (tool === 'seed') {
-      const msg = onSeedPoint(selectedObjId, pt, frameTimeRef.current);
-      setSeedMsg(msg || null);
-      setTool('pan');
-      // 2 点目のあとは記録が始まるコマへ戻す。
-      // 送ったままだと、そこから再生して始点を飛ばしてしまう。
-      void goToStart();
+      setGesture({ kind: 'seed' });
+      setDragStart(pt);
+      setDragCurrent(pt);
       return;
     }
 
@@ -717,6 +725,20 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     historyData, frameTolerance, onManualPlace, manualStep, stepFrame, isPlaying,
     manualOrder.join(','), manualPick,
   ]);
+
+  /** 大きさを決め終えて枠を確定する */
+  const confirmRoi = useCallback(() => {
+    if (!roiCenter) return;
+    const half = roiSize / 2;
+    onUpdateRoi(selectedObjId, {
+      x: Math.round(roiCenter.x - half),
+      y: Math.round(roiCenter.y - half),
+      width: Math.round(roiSize),
+      height: Math.round(roiSize),
+    }, videoRef.current || undefined);
+    setRoiCenter(null);
+    setTool('pan');
+  }, [roiCenter, roiSize, selectedObjId, onUpdateRoi, setTool]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!videoLoaded) return;
@@ -813,34 +835,18 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             ? '点を修正しました'
             : 'この時刻には記録がありません（枠のみ更新）'
         );
+      } else if (g.kind === 'seed') {
+        const tip = dragCurrent ?? pt;
+        const msg = onSeedPoint(selectedObjId, tip, frameTimeRef.current);
+        setSeedMsg(msg || null);
+        setTool('pan');
+        // 2 点目のあとは記録が始まるコマへ戻す。
+        // 送ったままだと、そこから再生して始点を飛ばしてしまう。
+        void goToStart();
       } else if (g.kind === 'roi') {
-        if (isTap && dragStart) {
-          // タップ: 既定サイズの正方形をその点を中心に置く
-          const half = roiSize / 2;
-          onUpdateRoi(selectedObjId, {
-            x: Math.round(dragStart.x - half),
-            y: Math.round(dragStart.y - half),
-            width: Math.round(roiSize),
-            height: Math.round(roiSize),
-          }, videoRef.current || undefined);
-        } else if (dragStart && dragCurrent) {
-          let x = Math.min(dragStart.x, dragCurrent.x);
-          let y = Math.min(dragStart.y, dragCurrent.y);
-          let w = Math.abs(dragCurrent.x - dragStart.x);
-          let h = Math.abs(dragCurrent.y - dragStart.y);
-          if (squareMode) {
-            const side = Math.max(w, h);
-            w = side; h = side;
-            if (dragCurrent.x < dragStart.x) x = dragStart.x - side;
-            if (dragCurrent.y < dragStart.y) y = dragStart.y - side;
-          }
-          if (w > 4 && h > 4) {
-            onUpdateRoi(selectedObjId, {
-              x: Math.round(x), y: Math.round(y),
-              width: Math.round(w), height: Math.round(h),
-            }, videoRef.current || undefined);
-          }
-        }
+        // 中心だけを決める。大きさは次の段階で決めるので、ここでは置かない。
+        const c = dragCurrent ?? dragStart;
+        if (c) setRoiCenter({ x: c.x, y: c.y });
       } else if (g.kind === 'calib-new') {
         if (!isTap && dragStart && dragCurrent && pixelDistance(dragStart, dragCurrent) >= 6) {
           applyLine(dragStart, dragCurrent);
@@ -878,7 +884,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     setDragCurrent(null);
     downScreenRef.current = null;
   }, [
-    gesture, dragStart, dragCurrent, squareMode, roiSize, selectedObjId, linePending,
+    gesture, dragStart, dragCurrent, roiSize, selectedObjId, linePending,
     calibration, onUpdateRoi, onManualCorrect, applyLine, applyPlane,
     onUpdateCalibration, setIsLineCalibrating, setTool, setCalibHandle, toCanvasPt,
   ]);
@@ -1165,48 +1171,82 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       ctx.restore();
     });
 
-    // ----- 枠ドラッグ中のプレビュー -----
-    if (gesture?.kind === 'roi' && dragStart && dragCurrent) {
-      const moved = pixelDistance(dragStart, dragCurrent);
-      let rx: number, ry: number, rw: number, rh: number;
-      if (moved < TAP_SLOP_PX * canvasPerScreen()) {
-        // タップ相当。これから置かれる既定サイズの枠を見せる
-        rw = roiSize; rh = roiSize;
-        rx = dragStart.x - roiSize / 2;
-        ry = dragStart.y - roiSize / 2;
-      } else {
-        rx = Math.min(dragStart.x, dragCurrent.x);
-        ry = Math.min(dragStart.y, dragCurrent.y);
-        rw = Math.abs(dragCurrent.x - dragStart.x);
-        rh = Math.abs(dragCurrent.y - dragStart.y);
-        if (squareMode) {
-          const side = Math.max(rw, rh);
-          rw = side; rh = side;
-          if (dragCurrent.x < dragStart.x) rx = dragStart.x - side;
-          if (dragCurrent.y < dragStart.y) ry = dragStart.y - side;
-        }
+    // ----- 初速ヒントを引いている最中の矢印 -----
+    // 始点は枠の中心で決まっているので、矢印として見せられる。
+    // 「1 コマあたりどれだけ動くか」を教えている、という意味が画で伝わる。
+    if (tool === 'seed' && gesture?.kind === 'seed' && dragCurrent) {
+      const o = objects.find(x => x.id === selectedObjId);
+      const from = o?.initialRoi
+        ? {
+            x: o.initialRoi.x + o.initialRoi.width / 2,
+            y: o.initialRoi.y + o.initialRoi.height / 2,
+          }
+        : null;
+      if (from) {
+        const color = o?.color || '#f59e0b';
+        ctx.save();
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 5 * k;
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y); ctx.lineTo(dragCurrent.x, dragCurrent.y);
+        ctx.stroke();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2.5 * k;
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y); ctx.lineTo(dragCurrent.x, dragCurrent.y);
+        ctx.stroke();
+        // 矢じり
+        const ang = Math.atan2(dragCurrent.y - from.y, dragCurrent.x - from.x);
+        const a = 13 * k;
+        ctx.beginPath();
+        ctx.moveTo(dragCurrent.x, dragCurrent.y);
+        ctx.lineTo(dragCurrent.x - a * Math.cos(ang - 0.42), dragCurrent.y - a * Math.sin(ang - 0.42));
+        ctx.moveTo(dragCurrent.x, dragCurrent.y);
+        ctx.lineTo(dragCurrent.x - a * Math.cos(ang + 0.42), dragCurrent.y - a * Math.sin(ang + 0.42));
+        ctx.stroke();
+        ctx.restore();
+        // 先端は塗らない。合わせている画素が見えなくなる
+        drawCrosshair(ctx, dragCurrent.x, dragCurrent.y, color, k, 10, 2.4, 1.4);
       }
+    }
+
+    // ----- 枠を置くときのプレビュー -----
+    // 中心を決める段階（指の下）と、大きさを決める段階（確定した中心）で
+    // 同じ形を出す。中心は塗らない — 狙っている画素が見えなくなるため。
+    // 指を動かしている間は指の下を出す（中心を置き直している最中）。
+    // そうでなければ確定した中心。
+    const previewCenter = tool === 'roi'
+      ? ((gesture?.kind === 'roi' && dragCurrent) ? dragCurrent : roiCenter)
+      : null;
+    if (previewCenter) {
+      const half = roiSize / 2;
+      const rx = previewCenter.x - half;
+      const ry = previewCenter.y - half;
       const target = objects.find(o => o.id === selectedObjId);
-      const tooSmall = Math.min(rw, rh) < MIN_ROI_SIZE;
-      const marginal = !tooSmall && Math.min(rw, rh) < RECOMMENDED_ROI_SIZE;
+      const tooSmall = roiSize < MIN_ROI_SIZE;
+      const marginal = !tooSmall && roiSize < RECOMMENDED_ROI_SIZE;
       const guide = tooSmall ? '#ef4444' : marginal ? '#f59e0b' : (target?.color || '#fff');
 
+      ctx.save();
       ctx.strokeStyle = guide;
       ctx.lineWidth = 2 * k;
       ctx.setLineDash([5 * k, 4 * k]);
-      ctx.strokeRect(rx, ry, rw, rh);
+      ctx.strokeRect(rx, ry, roiSize, roiSize);
       ctx.setLineDash([]);
-      ctx.fillStyle = tooSmall ? 'rgba(239,68,68,0.16)' : 'rgba(255,255,255,0.08)';
-      ctx.fillRect(rx, ry, rw, rh);
+      ctx.fillStyle = tooSmall ? 'rgba(239,68,68,0.16)' : 'rgba(255,255,255,0.06)';
+      ctx.fillRect(rx, ry, roiSize, roiSize);
+      ctx.restore();
+      drawCrosshair(ctx, previewCenter.x, previewCenter.y, guide, k, 10, 2.4, 1.4);
 
-      const txt = `${Math.round(rw)}×${Math.round(rh)}px`
-        + (tooSmall ? ` 小さすぎ` : marginal ? ' やや小' : '');
+      const txt = `${Math.round(roiSize)}px`
+        + (tooSmall ? ' 小さすぎ' : marginal ? ' やや小' : '');
       ctx.font = `bold ${12 * k}px JetBrains Mono, monospace`;
       const tw = ctx.measureText(txt).width;
       ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      ctx.fillRect(rx - 2 * k, ry + rh + 3 * k, tw + 10 * k, 18 * k);
+      ctx.fillRect(rx - 2 * k, ry + roiSize + 3 * k, tw + 10 * k, 18 * k);
       ctx.fillStyle = guide;
-      ctx.fillText(txt, rx + 3 * k, ry + rh + 16 * k);
+      ctx.fillText(txt, rx + 3 * k, ry + roiSize + 16 * k);
     }
 
     // ----- 2点間校正 -----
@@ -1440,8 +1480,9 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     }
   }, [
     historyData, objects, selectedObjId, showTrail, gesture, dragStart, dragCurrent,
-    squareMode, calibration, tool, isPlaying, roiSize, linePending, calibHandle,
+    calibration, tool, isPlaying, roiSize, linePending, calibHandle,
     canvasPerScreen, view.z, nearestFrameIndex, grabPoint, frameTolerance, issueTimes,
+    roiCenter,
   ]);
 
   renderRef.current = renderFrame;
@@ -1851,13 +1892,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     }
     if (tool === 'roi') {
       return {
-        text: `${selectedObjId} の枠 — 対象をタップ（または囲んでドラッグ）`,
+        text: roiCenter
+          ? '大きさを合わせて「決定」'
+          : `${selectedObjId} — 対象の中心を押す（指を動かすと拡大鏡で合わせられます）`,
         bg: `${selected?.color || '#6366f1'}f0`, color: '#fff',
       };
     }
     if (tool === 'seed') {
       return {
-        text: `${selectedObjId} が移動した先をタップ`,
+        text: `${selectedObjId} の枠から、移動した先まで指でなぞる`,
         bg: 'rgba(245,158,11,0.95)', color: '#000',
       };
     }
@@ -2075,6 +2118,47 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         {loupePos && (
           <div className="loupe" style={{ left: loupePos.left, top: loupePos.top }}>
             <canvas ref={loupeRef} width={LOUPE_SIZE} height={LOUPE_SIZE} />
+          </div>
+        )}
+
+        {/* ---- 枠の大きさ ---- */}
+        {tool === 'roi' && roiCenter && (
+          <div
+            className="stage__sizebar fade-in"
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
+            <div className="row-between" style={{ fontSize: '0.78rem' }}>
+              <span>枠の大きさ</span>
+              <b className="mono" style={{
+                color: roiSize < RECOMMENDED_ROI_SIZE ? 'var(--color-warning)' : 'var(--text-primary)',
+              }}>{roiSize} px</b>
+            </div>
+            <input
+              type="range" min={MIN_ROI_SIZE} max={160} step={2}
+              value={roiSize}
+              onChange={e => setRoiSize(parseInt(e.target.value, 10))}
+            />
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ flex: 1 }}
+                onClick={() => setRoiCenter(null)}
+              >
+                位置を取り直す
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                style={{ flex: 1 }}
+                onClick={confirmRoi}
+              >
+                決定
+              </button>
+            </div>
+            <div className="hint" style={{ margin: 0 }}>
+              枠の中は、対象と一緒に動くものだけで埋めてください。
+              映像をもう一度押すと中心を置き直せます。
+            </div>
           </div>
         )}
 
