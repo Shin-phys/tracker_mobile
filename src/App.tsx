@@ -41,10 +41,11 @@ import { ObjectsSheet } from './components/sheets/ObjectsSheet';
 import { CalibSheet } from './components/sheets/CalibSheet';
 import { TuneSheet } from './components/sheets/TuneSheet';
 import { DataSheet } from './components/sheets/DataSheet';
+import { TrimSheet } from './components/sheets/TrimSheet';
 import { AxisKey } from './components/MotionGraph';
 import { DEFAULT_SMOOTH_WINDOW } from './utils/graphSmooth';
 
-import { Layers, Ruler, SlidersHorizontal, LineChart, X } from 'lucide-react';
+import { Layers, Ruler, SlidersHorizontal, LineChart, X, Scissors } from 'lucide-react';
 
 // -------------------------------------------------
 // 定数
@@ -75,9 +76,11 @@ const makeDefaultObjects = (): TrackedObject[] =>
  *  スマホは PC より余裕がないので Ver.2 の 200ms より少し長く取る。 */
 const HISTORY_FLUSH_MS = 300;
 
-type TabId = 'objects' | 'calib' | 'tune' | 'data';
+type TabId = 'trim' | 'objects' | 'calib' | 'tune' | 'data';
 
 const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
+  // 並びがそのまま作業順になっている（トリム → 対象 → 校正 → 設定 → データ）
+  { id: 'trim', label: 'トリム', icon: <Scissors size={19} /> },
   { id: 'objects', label: '対象', icon: <Layers size={19} /> },
   { id: 'calib', label: '校正', icon: <Ruler size={19} /> },
   { id: 'tune', label: '設定', icon: <SlidersHorizontal size={19} /> },
@@ -918,6 +921,7 @@ export const App: React.FC = () => {
         calibHandle={calibHandle}
         setCalibHandle={setCalibHandle}
         seekRequest={seekRequest}
+        trimMode={tab === 'trim'}
       />
 
       {/* ---- 通知 ---- */}
@@ -954,6 +958,18 @@ export const App: React.FC = () => {
             {tabTitle?.label}
           </div>
           <div className="sheet__body">
+            {tab === 'trim' && (
+              <TrimSheet
+                objects={objects}
+                timeRange={timeRange}
+                onChangeTimeRange={handleChangeTimeRange}
+                duration={videoDuration}
+                historyData={historyData}
+                fpsSettings={fpsSettings}
+                videoLoaded={videoLoaded}
+              />
+            )}
+
             {tab === 'objects' && (
               <ObjectsSheet
                 objects={objects}

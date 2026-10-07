@@ -184,8 +184,10 @@ body {
 
 .stage__toolbar {
   position: absolute;
-  left: 8px;
-  top: 8px;
+  left: 2px;
+  top: 2px;
+  /* 縁のかすりも吸収する余白。ここは「映像の外」として扱う */
+  padding: 6px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -194,8 +196,9 @@ body {
 
 .stage__zoombar {
   position: absolute;
-  right: 8px;
-  top: 8px;
+  right: 2px;
+  top: 2px;
+  padding: 6px;
   display: flex;
   flex-direction: column;
   gap: 6px;

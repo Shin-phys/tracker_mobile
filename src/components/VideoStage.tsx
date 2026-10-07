@@ -43,7 +43,8 @@ import {
 import {
   Play, Pause, RotateCcw, Upload, Hand, Square, Move, Crosshair, Target,
   MousePointerClick, Undo2,
-  ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Route,
+  ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Route, SkipBack,
+  ChevronUp, ChevronDown,
   Scissors, CornerDownLeft, CornerDownRight, XCircle, ListVideo,
 } from 'lucide-react';
 
@@ -61,6 +62,8 @@ interface VideoStageProps {
   onManualUndo: () => boolean;
   /** 初速ヒント。数コマ先で対象を指す。戻り値は画面に出す一言（空なら何も言わない） */
   onSeedPoint: (objId: string, point: Point, fileTime: number) => string;
+  /** トリムタブを開いているか。開いている間だけ再生バーに区間の操作を出す */
+  trimMode: boolean;
   calibration: ScaleCalibration;
   onUpdateCalibration: (calib: ScaleCalibration) => void;
   onProcessFrame: (videoEl: HTMLVideoElement, timestamp: number, frameIndex: number) => void;
@@ -138,7 +141,7 @@ interface View {
 export const VideoStage: React.FC<VideoStageProps> = ({
   objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
-  onSeedPoint,
+  onSeedPoint, trimMode,
   historyData, onResetData, onClearTrail, onFlushHistory, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
   onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
@@ -187,6 +190,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [correctMsg, setCorrectMsg] = useState<string | null>(null);
   /** 初速ヒントの結果の一言。普段は null（黙っている） */
   const [seedMsg, setSeedMsg] = useState<string | null>(null);
+  /** 注意書きを開いているか。既定は畳む */
+  const [alertsOpen, setAlertsOpen] = useState(false);
   /**
    * いま表示されているフレームの実時刻（mediaTime）。
    * 「要求した時刻」ではなくブラウザが実際に見せたフレームの時刻なので、
@@ -467,6 +472,22 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   }, [seedMsg]);
 
   /**
+   * 枠ツールに入ったら、記録が始まるコマへ送る。
+   *
+   * 枠はそのコマの画からテンプレートを作るので、別のコマで置くと
+   * 「始点のコマに物体がいない」「物体ごとに別のコマ」という事故になる。
+   * 警告で後追いするより、置かせる前に揃えてしまうほうが確実。
+   */
+  useEffect(() => {
+    if (tool !== 'roi' || !videoLoaded) return;
+    const v = videoRef.current;
+    if (!v) return;
+    if (Math.abs(v.currentTime - restartTime) < 1e-3) return;
+    void goToStart();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool, videoLoaded]);
+
+  /**
    * 初速ヒントに入ったら、枠を置いたコマから数コマ送る。
    * 2 点が近すぎると、1 コマあたりの移動量の精度が出ないため。
    */
@@ -601,6 +622,9 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       const msg = onSeedPoint(selectedObjId, pt, frameTimeRef.current);
       setSeedMsg(msg || null);
       setTool('pan');
+      // 2 点目のあとは記録が始まるコマへ戻す。
+      // 送ったままだと、そこから再生して始点を飛ばしてしまう。
+      void goToStart();
       return;
     }
 
@@ -1676,6 +1700,27 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const restartTime = restartTimeFor(timeRange, roiTimes);
 
   /**
+   * 記録が始まるコマへ送るだけ。軌跡は消さない。
+   * やり直し（↺）と混同されていたので、別のボタンに分けた。
+   */
+  const goToStart = useCallback(async () => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause();
+    setIsPlaying(false);
+    try {
+      const t = await seekToFrameTime(v, restartTime);
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+    } catch (_) {
+      v.currentTime = restartTime;
+      setCurrentTime(restartTime);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restartTime, setIsPlaying]);
+
+
+  /**
    * 全コマ処理 — 再生せずに 1 コマずつシークして、すべてのフレームを処理する。
    *
    * なぜ必要か
@@ -1847,6 +1892,75 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     return null;
   })();
 
+
+  /**
+   * 再生バーに出す注意書き。
+   *
+   * 1 件ずつ行を足していくと、出るたびに映像とグラフが押し出される。
+   * 再生しながらデータを見ているときに、これがいちばん効く邪魔になる。
+   * 件数のバッジ 1 行に畳み、開いたときだけ中身を出す。
+   */
+  type Alert = {
+    id: string;
+    short: string;
+    body: React.ReactNode;
+    action?: { label: string; run: () => void };
+  };
+  const alerts: Alert[] = [];
+  if (videoLoaded) {
+    if (startMismatch && roiStartTime !== null && timeRange.start !== null) {
+      alerts.push({
+        id: 'start',
+        short: '枠のコマと始点がずれています',
+        body: <>枠を置いたのは {roiStartTime.toFixed(3)} s のコマですが、始点は{' '}
+          {timeRange.start.toFixed(3)} s です。始点のコマに物体がいないと追跡が始まりません。</>,
+        action: {
+          label: '枠のコマを始点に',
+          run: () => onChangeTimeRange({ ...timeRange, start: roiStartTime }),
+        },
+      });
+    }
+    if (roiFramesDiffer) {
+      alerts.push({
+        id: 'spread',
+        short: '物体ごとに別のコマで枠を置いています',
+        body: <>物体ごとに別のコマで枠を置いています（差 {roiSpread.toFixed(3)} s）。
+          戻れるコマは 1 つしかないので、片方は必ず外れます。同じコマまで戻して置き直してください。</>,
+      });
+    }
+    if (trackQuality.issues.length > 0) {
+      alerts.push({
+        id: 'jump',
+        short: `位置の飛んだコマ ${trackQuality.issues.length} 個`,
+        body: <>位置の飛んでいるコマが {trackQuality.issues.length} 個あります
+          （{trackQuality.issues.slice(0, 4).map(v => v.timestamp.toFixed(3)).join(' / ')}
+          {trackQuality.issues.length > 4 ? ' …' : ''} s・映像では橙の破線で囲んでいます）。
+          動画側のコマの時刻ずれか、追跡の失敗です。速度と加速度はこの前後で必ず暴れます。</>,
+      });
+    }
+    if (trackQuality.blurLimitTime !== null) {
+      const end = trackQuality.blurLimitTime;
+      alerts.push({
+        id: 'blur',
+        short: `${end.toFixed(2)} s からブレが大きすぎます`,
+        body: <>{end.toFixed(3)} s から、1 コマの移動量が枠の大きさに近づきます。
+          対象が自分の大きさ以上に流れて写るので、ここから先の点は中心からずれます。</>,
+        action: {
+          label: 'ここを終点に',
+          run: () => onChangeTimeRange({ ...timeRange, end }),
+        },
+      });
+    }
+    if (tooFewPoints) {
+      alerts.push({
+        id: 'few',
+        short: `区間内が ${pointsInRange} 点しかありません`,
+        body: <>区間内が {pointsInRange} 点しかありません。{MIN_RANGE_POINTS} 点を切ると
+          Butterworth の遮断周波数の自動選択が不安定になります。区間を広げてください。</>,
+      });
+    }
+  }
+
   const toolBtn = (t: StageTool, icon: React.ReactNode, label: string) => (
     <button
       key={t}
@@ -1908,7 +2022,14 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
         {/* ---- ツールバー ---- */}
         {videoLoaded && (
-          <div className="stage__toolbar">
+          <div
+            className="stage__toolbar"
+            // 浮いている操作帯は「映像の外」として扱う。ここで止めないと、
+            // ボタンを押した座標がそのまま映像のタップとして流れ、
+            // 枠ツール中なら枠が置かれてしまう。
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
             {toolBtn('pan', <Hand size={17} />, '移動')}
             {toolBtn('roi', <Square size={17} />, '枠を指定')}
             {toolBtn('correct', <Move size={17} />, '手動修正')}
@@ -1920,7 +2041,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
         {/* ---- ズーム ---- */}
         {videoLoaded && (
-          <div className="stage__zoombar">
+          <div
+            className="stage__zoombar"
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
             <button className="btn btn-icon btn-sm btn-float" aria-label="拡大" onClick={() => zoomBy(1.5)}>
               <ZoomIn size={17} />
             </button>
@@ -2009,8 +2134,17 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           </button>
           <button className="btn btn-secondary btn-icon btn-sm" onClick={handleRestart}
             disabled={!videoLoaded || sweeping}
-            aria-label="軌跡を消し、枠を戻る先のコマの位置へ戻して、記録が始まる時刻へ送る">
+            aria-label={`やり直し — 軌跡を消し、枠を戻して ${restartTime.toFixed(3)} s へ送る`}
+            title={`やり直し → ${restartTime.toFixed(3)} s`}>
             <RotateCcw size={16} />
+          </button>
+          {/* 記録が始まるコマへ移動するだけ。軌跡は消さない。
+              やり直しと混同されていたので、別のボタンとして分けた。 */}
+          <button className="btn btn-secondary btn-icon btn-sm" onClick={() => void goToStart()}
+            disabled={!videoLoaded || sweeping}
+            aria-label={`始点へ — 記録が始まる ${restartTime.toFixed(3)} s へ送る（軌跡は消さない）`}
+            title={`始点へ → ${restartTime.toFixed(3)} s`}>
+            <SkipBack size={16} />
           </button>
 
           <button
@@ -2173,8 +2307,10 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           </span>
         </div>
 
-        {/* ---- 解析区間 ---- */}
-        {videoLoaded && (
+        {/* ---- 解析区間（トリムタブを開いている間だけ） ----
+             どのタブでも出していると、使わない時間のほうが長いのに
+             場所だけ占め続ける。説明はトリムタブ側に置いた。 */}
+        {videoLoaded && trimMode && (
           <div className="playbar__row" style={{ gap: 6, flexWrap: 'wrap' }}>
             <Scissors
               size={14}
@@ -2212,124 +2348,54 @@ export const VideoStage: React.FC<VideoStageProps> = ({
                   {timeRange.start !== null ? timeRange.start.toFixed(2) : '先頭'}
                   〜
                   {timeRange.end !== null ? timeRange.end.toFixed(2) : '末尾'} s
-                  {rangeSpanSec > 0 && ` (${rangeSpanSec.toFixed(2)}s`}
-                  {rangeSpanSec > 0 && Math.abs(rangeSpanReal - rangeSpanSec) > 1e-6
-                    && ` / 実${rangeSpanReal.toFixed(2)}s`}
-                  {rangeSpanSec > 0 && historyData.length > 0 && `・${pointsInRange}点`}
-                  {rangeSpanSec > 0 && ')'}
                 </>
               ) : '動画全体'}
             </span>
-            {/* 枠を置いたコマと区間の始点がずれていると、始点のコマに物体がいない。
-                気づかないと「再生しても点が増えない」で詰まるので、直す手段ごと出す。 */}
-            {(startMismatch || roiFramesDiffer) && (
-              <div style={{
-                flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8,
-                flexWrap: 'wrap', fontSize: '0.72rem', color: '#fcd34d', lineHeight: 1.5,
-              }}>
-                <span style={{ flex: 1, minWidth: 200 }}>
-                  {startMismatch && roiStartTime !== null && timeRange.start !== null && (
-                    <>
-                      ⚠ 枠を置いたのは {roiStartTime.toFixed(3)} s のコマですが、始点は
-                      {' '}{timeRange.start.toFixed(3)} s です。始点のコマに物体がいないと
-                      追跡が始まりません。{' '}
-                    </>
-                  )}
-                  {roiFramesDiffer && (
-                    <>
-                      ⚠ 物体ごとに別のコマで枠を置いています（差 {roiSpread.toFixed(3)} s）。
-                      同じコマまで戻して置き直してください。片方は必ず外れます。
-                    </>
-                  )}
-                </span>
-                {startMismatch && roiStartTime !== null && (
-                  <button
-                    className="btn btn-warning btn-sm"
-                    onClick={() => onChangeTimeRange({ ...timeRange, start: roiStartTime })}
-                  >
-                    枠のコマを始点に
-                  </button>
-                )}
-              </div>
-            )}
-
-            {/* コマの点検結果。数値が合わないとき、原因がここにあることが多い */}
-            {(trackQuality.issues.length > 0 || trackQuality.blurLimitTime !== null) && (
-              <div style={{
-                flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8,
-                flexWrap: 'wrap', fontSize: '0.72rem', color: '#fcd34d', lineHeight: 1.5,
-              }}>
-                <span style={{ flex: 1, minWidth: 200 }}>
-                  {trackQuality.issues.length > 0 && (
-                    <>
-                      ⚠ 位置の飛んでいるコマが {trackQuality.issues.length} 個あります
-                      （{trackQuality.issues.slice(0, 4).map(v => v.timestamp.toFixed(3)).join(' / ')}
-                      {trackQuality.issues.length > 4 ? ' …' : ''} s・映像では橙の破線で囲んでいます）。
-                      動画側のコマの時刻ずれか、追跡の失敗です。速度と加速度はこの前後で必ず暴れます。{' '}
-                    </>
-                  )}
-                  {trackQuality.blurLimitTime !== null && (
-                    <>
-                      ⚠ {trackQuality.blurLimitTime.toFixed(3)} s から、1 コマの移動量が枠の大きさに
-                      近づきます。対象が自分の大きさ以上に流れて写るので、ここから先の点は
-                      中心からずれます。
-                    </>
-                  )}
-                </span>
-                {trackQuality.blurLimitTime !== null && (
-                  <button
-                    className="btn btn-warning btn-sm"
-                    onClick={() => onChangeTimeRange({ ...timeRange, end: trackQuality.blurLimitTime })}
-                    title="ブレが大きくなる手前を区間の終点にします"
-                  >
-                    ここを終点に
-                  </button>
-                )}
-              </div>
-            )}
-
-            <span className="hint" style={{
-              flexBasis: '100%', margin: 0, lineHeight: 1.5,
-              color: tooFewPoints ? '#fcd34d' : undefined,
-            }}>
-              {tooFewPoints ? (
-                <>⚠ 区間内が {pointsInRange} 点しかありません。{MIN_RANGE_POINTS} 点を切ると
-                  Butterworth の遮断周波数の自動選択が不安定になります。区間を広げてください。</>
-              ) : rangeActive ? (
-                <>区間外は追跡も記録もしません。終点で自動停止します。
-                  グラフ・CSV もこの区間だけを使います。
-                  {historyData.length > 0 &&
-                    ' 取り直すときは、やり直しボタンを押してください（軌跡を消し、枠を始点のコマの位置へ戻して始点へ送ります）。'}</>
-              ) : (
-                <>頭の準備時間や着地後の跳ね返りを外すと、フィルタの自動遮断周波数が
-                  運動区間だけを見るようになり、数値が安定します（任意）。
-                  {roiStartTime !== null &&
-                    ` いまは枠を置いた ${roiStartTime.toFixed(3)} s のコマが、やり直しで戻る先です。`}</>
-              )}
-            </span>
           </div>
         )}
 
-        {/* 枠ツールのときだけ、タップで置く枠の大きさを調整できるようにする */}
-        {tool === 'roi' && videoLoaded && (
-          <div className="playbar__row fade-in">
-            <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', flexShrink: 0 }}>
-              枠サイズ
-            </span>
-            <input
-              type="range" min={MIN_ROI_SIZE} max={160} step={2}
-              value={roiSize}
-              onChange={e => setRoiSize(parseInt(e.target.value, 10))}
-              style={{ flex: 1 }}
-            />
-            <span className="mono" style={{
-              fontSize: '0.72rem', flexShrink: 0, minWidth: 44, textAlign: 'right',
-              color: roiSize < RECOMMENDED_ROI_SIZE ? 'var(--color-warning)' : 'var(--text-primary)',
-            }}>
-              {roiSize}px
-            </span>
+        {/* ---- 注意書き ----
+             出るたびに行が伸びると、映像とグラフが押し出される。
+             件数のバッジ 1 行に畳み、開いたときだけ中身を出す。 */}
+        {alerts.length > 0 && (
+          <div className="playbar__row" style={{ gap: 8 }}>
+            <button
+              className="btn btn-warning btn-sm"
+              style={{ flexShrink: 0 }}
+              onClick={() => setAlertsOpen(v => !v)}
+              aria-expanded={alertsOpen}
+              aria-label={`注意 ${alerts.length} 件`}
+            >
+              ⚠ {alerts.length}件
+              {alertsOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            </button>
+            {!alertsOpen && (
+              <span style={{
+                fontSize: '0.72rem', color: '#fcd34d',
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>
+                {alerts[0].short}{alerts.length > 1 ? ` ほか${alerts.length - 1}件` : ''}
+              </span>
+            )}
           </div>
         )}
+        {alertsOpen && alerts.map(a => (
+          <div key={a.id} className="playbar__row fade-in" style={{
+            gap: 8, alignItems: 'flex-start',
+            fontSize: '0.72rem', color: '#fcd34d', lineHeight: 1.5,
+          }}>
+            <span style={{ flex: 1 }}>⚠ {a.body}</span>
+            {a.action && (
+              <button
+                className="btn btn-warning btn-sm"
+                style={{ flexShrink: 0 }}
+                onClick={a.action.run}
+              >
+                {a.action.label}
+              </button>
+            )}
+          </div>
+        ))}
 
         {!rvfcSupported && (
           <div style={{ fontSize: '0.68rem', color: 'var(--color-warning)' }}>
