@@ -1,22 +1,20 @@
 // src/components/sheets/TuneSheet.tsx
-// FPS と追跡アルゴリズムの設定。
+// 追跡アルゴリズムの設定。
 // 詳細設定は既定で畳んでおき、スマホの狭い画面を圧迫しないようにする。
+//
+// 撮影 fps（時間軸の換算）はここではなくデータタブにある。
+// 数値が合うかどうかを見ながら決める設定なので、CSV とグラフの隣に置くほうが
+// 迷わない（実際、240fps で撮っていても 120 を入れたほうが合う、という
+// ことが起きる。説明より、出てくる秒数を見て合わせるほうが確実）。
 
 import React, { useState } from 'react';
 import {
-  FpsSettings, TrackingSettings, MarkerMode, DEFAULT_TRACKING,
+  TrackingSettings, MarkerMode, DEFAULT_TRACKING,
 } from '../../types';
 import { Card, Slider, Switch } from '../ui';
-import {
-  CAPTURE_FPS_PRESETS, describeTimeScale, isTimeScaled, durationCheck,
-} from '../../utils/timeScale';
-import { Timer, Settings2, RotateCcw, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
+import { Settings2, RotateCcw, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface Props {
-  fpsSettings: FpsSettings;
-  onUpdateFpsSettings: (f: FpsSettings) => void;
-  /** 動画の長さ [s] */
-  videoDuration?: number;
   tracking: TrackingSettings;
   onUpdateTracking: (t: TrackingSettings) => void;
   onResetData: () => void;
@@ -28,88 +26,12 @@ const MARKER_MODES: { id: MarkerMode; label: string }[] = [
 ];
 
 export const TuneSheet: React.FC<Props> = ({
-  fpsSettings, onUpdateFpsSettings, videoDuration = 0, tracking, onUpdateTracking, onResetData,
+  tracking, onUpdateTracking, onResetData,
 }) => {
   const [advanced, setAdvanced] = useState(false);
 
   return (
     <>
-      {/* ---- フレームレートと時間軸 ---- */}
-      <Card title={<><Timer size={16} color="var(--accent-primary)" />フレームレートと時間軸</>}>
-        <div className="notice notice-info">
-          ファイルのfps: <b>{fpsSettings.value.toFixed(2)} fps</b>（自動計測）
-          <div style={{ marginTop: 3, opacity: 0.85 }}>
-            動画を開いたときに、コマ送りして実フレーム間隔を測っています。
-            QuickTime の「エンコード FPS」と一致するはずです。
-          </div>
-        </div>
-
-        <div style={{ marginTop: 12, fontSize: '0.81rem', color: 'var(--text-secondary)' }}>
-          撮影fps（スロー動画のときに指定）
-        </div>
-        <div style={{ marginTop: 5 }}>
-          <input
-            type="number" inputMode="numeric" step="1" min="0" max="2000"
-            className="num-lg"
-            value={fpsSettings.captureFps || ''}
-            placeholder="未指定（通常の動画）"
-            onFocus={e => e.currentTarget.select()}
-            onChange={e => {
-              const v = parseFloat(e.target.value);
-              onUpdateFpsSettings({
-                ...fpsSettings,
-                captureFps: isFinite(v) && v > 0 ? v : 0,
-              });
-            }}
-          />
-        </div>
-
-        <div className="chips" style={{ marginTop: 9 }}>
-          <button
-            className={`chip ${!fpsSettings.captureFps ? 'is-active' : ''}`}
-            onClick={() => onUpdateFpsSettings({ ...fpsSettings, captureFps: 0 })}
-          >
-            通常
-          </button>
-          {CAPTURE_FPS_PRESETS.map(f => (
-            <button
-              key={f}
-              className={`chip ${Math.abs(fpsSettings.captureFps - f) < 0.01 ? 'is-active' : ''}`}
-              onClick={() => onUpdateFpsSettings({ ...fpsSettings, captureFps: f })}
-            >
-              {f}
-            </button>
-          ))}
-        </div>
-
-        <div
-          className={`notice ${isTimeScaled(fpsSettings) ? 'notice-warn' : 'notice-info'}`}
-          style={{ marginTop: 10 }}
-        >
-          時間軸: <b>{describeTimeScale(fpsSettings)}</b>
-          {/* 秒数でも出す。倍率だけだと、ファイルfps の計測が外れたときに
-              時間軸が黙って壊れていても気づけない */}
-          {videoDuration > 0 && (() => {
-            const d = durationCheck(videoDuration, fpsSettings);
-            return (
-              <div style={{ marginTop: 5, paddingTop: 5, borderTop: '1px solid rgba(255,255,255,0.12)' }}>
-                この動画: <span className="mono">再生 {d.playback.toFixed(2)} 秒</span>
-                {' → '}
-                <b className="mono">実時間 {d.real.toFixed(2)} 秒</b>
-                <div style={{ marginTop: 2, opacity: 0.85, fontSize: '0.73rem' }}>
-                  この秒数が実際の現象の長さと合っているか確認してください。
-                </div>
-              </div>
-            );
-          })()}
-        </div>
-
-        <div className="hint" style={{ marginTop: 8 }}>
-          240fps で撮って 30fps で書き出したスロー動画なら「撮影fps = 240」。
-          グラフと CSV の時刻・速度がこの倍率で実時間に直されます。
-        </div>
-      </Card>
-
       {/* ---- 追跡の詳細設定 ---- */}
       <Card
         title={<><Settings2 size={16} color="var(--accent-primary)" />追跡の詳細設定</>}

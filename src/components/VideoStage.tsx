@@ -62,6 +62,10 @@ interface VideoStageProps {
   onManualUndo: () => boolean;
   /** 初速ヒント。数コマ先で対象を指す。戻り値は画面に出す一言（空なら何も言わない） */
   onSeedPoint: (objId: string, point: Point, fileTime: number) => string;
+  /** 追跡が暴れたときの一時停止要求。増えるたびに止める */
+  pauseAt: number;
+  /** 枠の中心を決めている間を知らせる。シートを畳んで映像を広げてもらう */
+  onAimingChange: (aiming: boolean) => void;
   /** トリムタブを開いているか。開いている間だけ再生バーに区間の操作を出す */
   trimMode: boolean;
   calibration: ScaleCalibration;
@@ -142,7 +146,7 @@ interface View {
 export const VideoStage: React.FC<VideoStageProps> = ({
   objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
-  onSeedPoint, trimMode,
+  onSeedPoint, trimMode, pauseAt, onAimingChange,
   historyData, onResetData, onClearTrail, onFlushHistory, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
   onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
@@ -472,6 +476,12 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   useEffect(() => { if (tool !== 'correct') setCorrectMsg(null); }, [tool]);
   useEffect(() => { if (tool !== 'roi') setRoiCenter(null); }, [tool]);
+
+  // 枠ツールに入ってから確定するまで、シートを畳んでもらう
+  useEffect(() => {
+    onAimingChange(tool === 'roi');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool]);
 
   /** 初速ヒントの一言も、少し経ったら消す（警告は長めに出す） */
   useEffect(() => {
@@ -1655,6 +1665,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     return () => { cancelled = true; };
   }, [videoLoaded]);
 
+  /** 追跡が暴れたときの一時停止要求（App から届く） */
+  useEffect(() => {
+    if (!pauseAt) return;
+    const v = videoRef.current;
+    if (v) v.pause();
+    setIsPlaying(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pauseAt]);
+
   /** グラフからのシーク要求。再生中なら止めてから飛ぶ
    *  （そのまま再生を続けると、飛んだ先から重複して記録してしまう） */
   useEffect(() => {
@@ -2156,8 +2175,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               </button>
             </div>
             <div className="hint" style={{ margin: 0 }}>
-              枠の中は、対象と一緒に動くものだけで埋めてください。
-              映像をもう一度押すと中心を置き直せます。
+              <b>マーカー全体が入る大きさ</b>に。内側だけだと、光の反射や回転で滑ります。
+              映像をもう一度押せば中心を置き直せます。
             </div>
           </div>
         )}

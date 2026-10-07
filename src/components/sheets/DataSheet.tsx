@@ -11,7 +11,10 @@ import React, { useCallback, useMemo, useState } from 'react';
 import {
   TrackedObject, FrameData, FilterSettings, ScaleCalibration, FpsSettings,
 } from '../../types';
-import { timeScale, isTimeScaled, toFileTime } from '../../utils/timeScale';
+import {
+  timeScale, isTimeScaled, toFileTime, CAPTURE_FPS_PRESETS,
+  describeTimeScale, durationCheck,
+} from '../../utils/timeScale';
 import {
   applySavitzkyGolay, sgWindowSeconds, recommendSgWindow, SG_WINDOW_WARN_SEC,
 } from '../../utils/savitzkyGolay';
@@ -26,7 +29,7 @@ import { GraphPanel } from '../GraphPanel';
 import { AxisKey } from '../MotionGraph';
 import {
   Download, Share2, Sliders, Activity, ArrowRightLeft, ChevronDown, ChevronUp,
-  LineChart, Maximize2, X, Scissors,
+  LineChart, Maximize2, X, Scissors, Timer,
 } from 'lucide-react';
 
 interface Props {
@@ -54,9 +57,15 @@ interface Props {
   graphSmoothWindow: number;
   onChangeGraphSmooth: (on: boolean) => void;
   onChangeGraphSmoothWindow: (w: number) => void;
+
+  /** 撮影 fps の変更。時間軸の換算はここで決まる */
+  onUpdateFpsSettings: (f: FpsSettings) => void;
+  /** 動画の長さ [s]。実時間の確認に使う */
+  videoDuration?: number;
 }
 
 export const DataSheet: React.FC<Props> = ({
+  onUpdateFpsSettings, videoDuration = 0,
   objects, historyData: historyDataAll, timeRange,
   filterSettings, onUpdateFilterSettings, calibration,
   fpsSettings, onSeek,
@@ -603,6 +612,65 @@ export const DataSheet: React.FC<Props> = ({
             </div>
           </div>
         )}
+      </Card>
+
+      {/* ---- 撮影fps（時間軸の換算） ----
+           設定タブではなくここに置いている。数値が合うかどうかを見ながら
+           決める設定なので、CSV とグラフの隣にあるほうが迷わない。 */}
+      <Card title={<><Timer size={16} color="var(--accent-primary)" />撮影fps（スロー動画）</>}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input
+            type="number" inputMode="numeric" step="1" min="0" max="2000"
+            className="num-lg"
+            style={{ flex: 1 }}
+            value={fpsSettings.captureFps || ''}
+            placeholder="未指定（通常の動画）"
+            onFocus={e => e.currentTarget.select()}
+            onChange={e => {
+              const v = parseFloat(e.target.value);
+              onUpdateFpsSettings({
+                ...fpsSettings,
+                captureFps: isFinite(v) && v > 0 ? v : 0,
+              });
+            }}
+          />
+        </div>
+        <div className="chips" style={{ marginTop: 9 }}>
+          <button
+            className={`chip ${!fpsSettings.captureFps ? 'is-active' : ''}`}
+            onClick={() => onUpdateFpsSettings({ ...fpsSettings, captureFps: 0 })}
+          >
+            通常
+          </button>
+          {CAPTURE_FPS_PRESETS.map(f => (
+            <button
+              key={f}
+              className={`chip ${Math.abs(fpsSettings.captureFps - f) < 0.01 ? 'is-active' : ''}`}
+              onClick={() => onUpdateFpsSettings({ ...fpsSettings, captureFps: f })}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+        <div
+          className={`notice ${isTimeScaled(fpsSettings) ? 'notice-warn' : 'notice-info'}`}
+          style={{ marginTop: 10 }}
+        >
+          時間軸: <b>{describeTimeScale(fpsSettings)}</b>
+          {videoDuration > 0 && (() => {
+            const d = durationCheck(videoDuration, fpsSettings);
+            return (
+              <div style={{ marginTop: 4 }}>
+                この動画: <span className="mono">再生 {d.playback.toFixed(2)} 秒</span>
+                {' → '}
+                <b className="mono">実時間 {d.real.toFixed(2)} 秒</b>
+              </div>
+            );
+          })()}
+        </div>
+        <div className="hint" style={{ marginTop: 6 }}>
+          この秒数が実際の現象の長さと合うように決めてください。
+        </div>
       </Card>
 
       {/* ---- 書き出し ---- */}

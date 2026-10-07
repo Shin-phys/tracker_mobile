@@ -350,7 +350,9 @@ body {
 .tabbar {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* タブの数が増えても 1 列に収める（2 列になると映像の場所を食う） */
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   background: rgba(8, 13, 26, 0.96);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -369,10 +371,12 @@ body {
   border: none;
   color: var(--text-muted);
   font-family: inherit;
-  font-size: 0.66rem;
+  font-size: 0.62rem;
   font-weight: 600;
   cursor: pointer;
   position: relative;
+  min-width: 0;
+  white-space: nowrap;
   transition: color 0.15s ease;
 }
 

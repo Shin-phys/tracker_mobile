@@ -34,6 +34,7 @@ import {
 import {
   TimeRange, FULL_RANGE, inRange, normalizeRange, trackedPointAt, trackedStepAt,
 } from './utils/timeRange';
+import { recentStep } from './utils/frameCheck';
 
 import { TopBar } from './components/TopBar';
 import { VideoStage, StageTool } from './components/VideoStage';
@@ -151,6 +152,10 @@ export const App: React.FC = () => {
   const [tab, setTab] = useState<TabId>('objects');
   /** グラフのタップから動画をシークさせるための指示 */
   const [seekRequest, setSeekRequest] = useState<{ t: number; n: number } | null>(null);
+  /** 追跡が暴れたときに再生を止めるための合図（増えるたびに止める） */
+  const [pauseAt, setPauseAt] = useState(0);
+  /** 止めたあと、同じ再生中に何度も止めないための印 */
+  const haltedRef = useRef(false);
   const seekSeqRef = useRef(0);
 
   // ---- グラフ概形の表示状態 ----
@@ -244,6 +249,27 @@ export const App: React.FC = () => {
     }
   };
 
+  /**
+   * 枠の中心を決めている間はシートを畳む。
+   *
+   * シートが上がったままだと映像が狭く、枠の大きさを合わせる場所が無い。
+   * いちいちタブを押して下げる手間が要っていたので、自動で譲る。
+   * 終わったら元の高さへ戻す。
+   */
+  const sheetBeforeAimRef = useRef<number | null>(null);
+  const handleAimingChange = useCallback((aiming: boolean) => {
+    if (aiming) {
+      setSheetH(h => {
+        if (h > 8 && sheetBeforeAimRef.current === null) sheetBeforeAimRef.current = h;
+        return 0;
+      });
+    } else {
+      const back = sheetBeforeAimRef.current;
+      sheetBeforeAimRef.current = null;
+      if (back !== null) setSheetH(back);
+    }
+  }, []);
+
   const handleSeek = useCallback((t: number) => {
     seekSeqRef.current += 1;
     setSeekRequest({ t, n: seekSeqRef.current });
@@ -290,6 +316,8 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!isPlaying) flushHistory(true);
+    // 再生を始め直したら、また止められるようにする
+    if (isPlaying) haltedRef.current = false;
   }, [isPlaying, flushHistory]);
 
   // -------------------------------------------------
@@ -747,6 +775,8 @@ export const App: React.FC = () => {
         const seedTol = frameTolerance();
 
         const frameObjects: FrameData['objects'] = {};
+        /** このコマで「飛んだ」物体。判定は全部出そろってから */
+        const suspects: { id: string; step: number; base: number; atEdge: boolean }[] = [];
         const updates: { id: string; status: ObjectStatus; roi?: Rect; center?: Point }[] = [];
 
         activeObjs.forEach(obj => {
@@ -783,6 +813,22 @@ export const App: React.FC = () => {
                   `${obj.id}: 指した位置から ${Math.round(gap)}px 離れたものを追っています。`
                   + `別のものを掴んでいる可能性が高いので、枠を取り直してください。`
                 );
+              }
+            }
+
+            // 暴れの検出。
+            //   1. 相関ピークが探索窓の縁に出た＝追い切れていない
+            //   2. 1 コマの移動量が、直前までの移動量から大きく外れた
+            // スコアは高いまま壊れるので、ロスト判定では拾えない。
+            const prevP = prevFrame ? prevFrame.objects[obj.id] : null;
+            if (prevP && !prevP.lost) {
+              const step = Math.hypot(
+                res.center.x - prevP.xPx, res.center.y - prevP.yPx
+              );
+              const base = recentStep(currentHistory, obj.id, 8);
+              const jumped = base > 0.5 && step > Math.max(base * 3, base + 8);
+              if (res.atEdge || jumped) {
+                suspects.push({ id: obj.id, step, base, atEdge: res.atEdge });
               }
             }
 
@@ -824,6 +870,24 @@ export const App: React.FC = () => {
             console.error(`[App] Tracker error on ${obj.id}:`, objErr);
           }
         });
+
+
+        // 飛んだのが 1 つだけなら追跡の失敗。2 つ以上が同時に飛んでいたら
+        // 衝突かもしれないので止めない（運動量のやりとりは同時に起きるので、
+        // 本物の衝突では両方の速度が同じコマで変わる）。
+        if (suspects.length === 1 && !haltedRef.current) {
+          const sp = suspects[0];
+          haltedRef.current = true;
+          setPauseAt(n => n + 1);
+          setIsPlaying(false);
+          setNotice(
+            `${sp.id}: ${timestamp.toFixed(3)} s で追跡が飛びました`
+            + `（1 コマ ${Math.round(sp.step)}px・直前までは ${Math.round(sp.base)}px`
+            + `${sp.atEdge ? '・探索窓の縁に張り付き' : ''}）。ここで止めました。`
+            + `点を正しい位置へ直すか、枠を取り直してください。`
+          );
+          setTool('correct');
+        }
 
         const distances: FrameData['distances'] = {};
         for (let i = 0; i < activeObjs.length; i++) {
@@ -896,6 +960,8 @@ export const App: React.FC = () => {
         onManualPlace={handleManualPlace}
         onManualUndo={handleManualUndo}
         onSeedPoint={handleSeedPoint}
+        pauseAt={pauseAt}
+        onAimingChange={handleAimingChange}
         calibration={calibration}
         onUpdateCalibration={setCalibration}
         onProcessFrame={handleProcessFrame}
@@ -1003,9 +1069,6 @@ export const App: React.FC = () => {
             )}
             {tab === 'tune' && (
               <TuneSheet
-                fpsSettings={fpsSettings}
-                onUpdateFpsSettings={setFpsSettings}
-                videoDuration={videoDuration}
                 tracking={tracking}
                 onUpdateTracking={setTracking}
                 onResetData={handleResetData}
@@ -1013,6 +1076,8 @@ export const App: React.FC = () => {
             )}
             {tab === 'data' && (
               <DataSheet
+                onUpdateFpsSettings={setFpsSettings}
+                videoDuration={videoDuration}
                 objects={objects}
                 historyData={historyData}
                 timeRange={timeRange}
