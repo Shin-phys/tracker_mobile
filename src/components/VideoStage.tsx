@@ -21,6 +21,7 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import {
   TrackedObject, ScaleCalibration, Rect, Point, FrameData, FpsSettings, HaltInfo,
+  SeedResult,
 } from '../types';
 import { recalcScale, pixelDistance } from '../utils/calibration';
 import { applyHomography, invertHomography, Matrix3 } from '../utils/homography';
@@ -61,8 +62,14 @@ interface VideoStageProps {
   onManualPlace: (id: string, center: Point, fileTime: number) => boolean;
   /** 手動トラッキングの直前の 1 点を取り消す */
   onManualUndo: () => boolean;
-  /** 初速ヒント。数コマ先で対象を指す。戻り値は画面に出す一言（空なら何も言わない） */
-  onSeedPoint: (objId: string, point: Point, fileTime: number) => string;
+  /**
+   * 2 点目を指す。数コマ先で同じ対象を指してもらう。
+   * 戻り値は画面に出す一言（空なら何も言わない）。
+   * videoEl を渡すのは、そのコマでテンプレートが滑らないかを実測するため。
+   */
+  onSeedPoint: (
+    objId: string, point: Point, fileTime: number, videoEl?: HTMLVideoElement
+  ) => SeedResult;
   /** 追跡が暴れたときの一時停止要求。増えるたびに止める */
   pauseAt: number;
   /** 追跡が飛んで止めた、という事実。null なら何も起きていない */
@@ -210,7 +217,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   /** 修正ツールの操作結果を伝える一言（成功／記録なし） */
   const [correctMsg, setCorrectMsg] = useState<string | null>(null);
   /** 初速ヒントの結果の一言。普段は null（黙っている） */
-  const [seedMsg, setSeedMsg] = useState<string | null>(null);
+  const [seedMsg, setSeedMsg] = useState<SeedResult | null>(null);
   /** 注意書きを開いているか。既定は畳む */
   const [alertsOpen, setAlertsOpen] = useState(false);
   /**
@@ -223,6 +230,19 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [roiCenter, setRoiCenter] = useState<Point | null>(null);
   /** 切り落としたあとの一言 */
   const [cutMsg, setCutMsg] = useState<string | null>(null);
+  /**
+   * 切ったあと、枠を置いたら続けて 2 点目を指してもらうための印。
+   *
+   * なぜ続けるのか。枠を置き直しただけでは、同じ場所でまた壊れる。
+   * 壊れた理由は「そのコマのテンプレートと、そのコマの動きの大きさ」で
+   * 決まっていて、枠を引き直してもどちらも変わらないことが多い。
+   * 2 点目を指してもらえば、(1) 最初のコマから予測が効き、
+   * (2) その枠が本当にその対象を見つけられるかを実測できる。
+   * 止まった直後は、この 2 つがどちらも要る場面そのもの。
+   */
+  const chainSeedRef = useRef(false);
+  /** 枠を置いたら 2 点目へ進む、という待ち状態 */
+  const [pendingSeed, setPendingSeed] = useState(false);
   /**
    * 「ここまでは正しい」で選んでいる候補の番号。
    *
@@ -510,9 +530,13 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tool]);
 
-  /** 初速ヒントの一言も、少し経ったら消す（警告は長めに出す） */
+  /**
+   * 2 点目の結果は少し経ったら消す。
+   * ただし直し方（枠の大きさ）を出しているときは消さない。
+   * 押す前に消えるボタンは出さない方がましなので。
+   */
   useEffect(() => {
-    if (!seedMsg) return;
+    if (!seedMsg || seedMsg.betterSize !== undefined) return;
     const id = window.setTimeout(() => setSeedMsg(null), 7000);
     return () => window.clearTimeout(id);
   }, [seedMsg]);
@@ -696,11 +720,13 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     const dropped = onTruncateAfter(q.time);
     setCutMsg(
       dropped > 0
-        ? `${q.time.toFixed(3)} s より後の ${dropped} コマを捨てました。枠を置き直してください`
+        ? `${q.time.toFixed(3)} s より後の ${dropped} コマを捨てました。`
+          + `枠を置き直すと、続けて 2 点目を聞きます`
         : `${q.time.toFixed(3)} s まで残しました（捨てるコマはありませんでした）`
     );
     setRoiCenter(null);
     setPickIdx(null);
+    chainSeedRef.current = true;
     setTool('roi');
   }, [onTruncateAfter, setTool]);
 
@@ -871,8 +897,27 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       height: Math.round(roiSize),
     }, videoRef.current || undefined);
     setRoiCenter(null);
+    // 切った直後なら 2 点目へ続ける。ここで直接ツールを 'seed' にできない
+    // のは、枠の確定が App 側の state を経由するため。このレンダーの
+    // objects にはまだ新しい initialTime が入っておらず、送る先のコマを
+    // 間違える。印だけ立てて、反映されてから進む。
+    if (chainSeedRef.current) {
+      chainSeedRef.current = false;
+      setPendingSeed(true);
+      return;
+    }
     setTool('pan');
   }, [roiCenter, roiSize, selectedObjId, onUpdateRoi, setTool]);
+
+  // 枠が App 側へ反映されたら 2 点目へ進む
+  useEffect(() => {
+    if (!pendingSeed) return;
+    const o = objects.find(x => x.id === selectedObjId);
+    if (!o || !o.initialRoi || o.initialTime === null) return;
+    setPendingSeed(false);
+    setTool('seed');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingSeed, objects, selectedObjId]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!videoLoaded) return;
@@ -977,8 +1022,10 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         );
       } else if (g.kind === 'seed') {
         const tip = dragCurrent ?? pt;
-        const msg = onSeedPoint(selectedObjId, tip, frameTimeRef.current);
-        setSeedMsg(msg || null);
+        const r = onSeedPoint(
+          selectedObjId, tip, frameTimeRef.current, videoRef.current || undefined
+        );
+        setSeedMsg(r.msg ? r : null);
         setTool('pan');
         // 2 点目のあとは記録が始まるコマへ戻す。
         // 送ったままだと、そこから再生して始点を飛ばしてしまう。
@@ -2174,8 +2221,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         bg: 'rgba(245,158,11,0.95)', color: '#000',
       };
     }
-    if (seedMsg) {
-      return { text: `⚠ ${seedMsg}`, bg: 'rgba(239,68,68,0.95)', color: '#fff' };
+    if (seedMsg && seedMsg.betterSize === undefined) {
+      return { text: `⚠ ${seedMsg.msg}`, bg: 'rgba(239,68,68,0.95)', color: '#fff' };
     }
     if (tool === 'origin') {
       return {
@@ -2405,7 +2452,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               }}>{roiSize} px</b>
             </div>
             <input
-              type="range" min={MIN_ROI_SIZE} max={160} step={2}
+              type="range" min={MIN_ROI_SIZE} max={260} step={2}
               value={roiSize}
               onChange={e => setRoiSize(parseInt(e.target.value, 10))}
             />
@@ -2458,6 +2505,52 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             >
               <Trash2 size={15} />
               {selectedObjId} のこの点を消す
+            </button>
+          </div>
+        )}
+
+        {/* ---- 2 点目で「滑る」と分かったときの案内 ---- */}
+        {/*
+            原因を告げるだけでは、利用者は枠の大きさを自分で当てにいく
+            ことになる。測った結果が手元にあるのだから、その大きさで
+            置き直すところまで渡す。
+        */}
+        {seedMsg && seedMsg.betterSize !== undefined && tool !== 'seed' && (
+          <div
+            className="stage__haltbar fade-in"
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
+            <div className="stage__haltbar-title">⚠ この枠では滑ります</div>
+            <div className="hint" style={{ margin: 0 }}>{seedMsg.msg}</div>
+            <button
+              className="btn btn-primary btn-sm"
+              style={{ width: '100%' }}
+              onClick={() => {
+                const n = seedMsg.betterSize as number;
+                const o = objects.find(x => x.id === selectedObjId);
+                const base = o?.initialRoi ?? o?.roi;
+                setSeedMsg(null);
+                setRoiSize(n);
+                if (base) {
+                  setRoiCenter({
+                    x: base.x + base.width / 2,
+                    y: base.y + base.height / 2,
+                  });
+                }
+                setTool('roi');
+                void goToStart();
+              }}
+            >
+              <Maximize size={15} />
+              枠を {seedMsg.betterSize}px にして置き直す
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              style={{ width: '100%' }}
+              onClick={() => setSeedMsg(null)}
+            >
+              このまま進める
             </button>
           </div>
         )}
