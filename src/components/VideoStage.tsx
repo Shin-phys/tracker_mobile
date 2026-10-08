@@ -50,7 +50,9 @@ import {
   Scissors, CornerDownLeft, CornerDownRight, XCircle, ListVideo, Trash2,
 } from 'lucide-react';
 
-export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual' | 'seed' | 'pick';
+export type StageTool =
+  | 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual' | 'seed'
+  | 'pick' | 'bridge';
 
 interface VideoStageProps {
   objects: TrackedObject[];
@@ -78,6 +80,15 @@ interface VideoStageProps {
   onTruncateAfter: (keepUntil: number) => number;
   /** 1 点だけ消す。グラフを見て後から外れ値に気づいたとき用 */
   onDropPoint: (objId: string, t: number) => boolean;
+  /**
+   * 橋渡しの 1 点。トラッカーが無ければその位置で作る。
+   * 戻り値はそのコマの対象を全部指し終えたか（呼び出し側がコマを進める）。
+   */
+  onBridgePoint: (
+    objId: string, point: Point, fileTime: number, videoEl?: HTMLVideoElement
+  ) => boolean;
+  /** 橋渡しを終えて自動に戻す。初速とテンプレートを作り直し、滑るかを測る */
+  onBridgeFinish: (videoEl?: HTMLVideoElement) => SeedResult;
   /**
    * 止めた案内を閉じる。
    * accept=true は「誤検出だった」＝印を外して当分検出を見送る。
@@ -170,7 +181,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
   onSeedPoint, trimMode, pauseAt, onAimingChange,
-  halt, onTruncateAfter, onDismissHalt, onDropPoint,
+  halt, onTruncateAfter, onDismissHalt, onDropPoint, onBridgePoint, onBridgeFinish,
   historyData, onResetData, onClearTrail, onFlushHistory, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
   onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
@@ -230,19 +241,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [roiCenter, setRoiCenter] = useState<Point | null>(null);
   /** 切り落としたあとの一言 */
   const [cutMsg, setCutMsg] = useState<string | null>(null);
-  /**
-   * 切ったあと、枠を置いたら続けて 2 点目を指してもらうための印。
-   *
-   * なぜ続けるのか。枠を置き直しただけでは、同じ場所でまた壊れる。
-   * 壊れた理由は「そのコマのテンプレートと、そのコマの動きの大きさ」で
-   * 決まっていて、枠を引き直してもどちらも変わらないことが多い。
-   * 2 点目を指してもらえば、(1) 最初のコマから予測が効き、
-   * (2) その枠が本当にその対象を見つけられるかを実測できる。
-   * 止まった直後は、この 2 つがどちらも要る場面そのもの。
-   */
-  const chainSeedRef = useRef(false);
-  /** 枠を置いたら 2 点目へ進む、という待ち状態 */
-  const [pendingSeed, setPendingSeed] = useState(false);
+  /** 橋渡しで指した点の数 */
+  const [bridgeCount, setBridgeCount] = useState(0);
   /**
    * 「ここまでは正しい」で選んでいる候補の番号。
    *
@@ -526,7 +526,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   // 枠ツールに入ってから確定するまで、シートを畳んでもらう
   useEffect(() => {
-    onAimingChange(tool === 'roi');
+    // 枠・橋渡し・戻す位置の選択は、映像を広く見せないと決められない
+    onAimingChange(tool === 'roi' || tool === 'bridge' || tool === 'pick');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tool]);
 
@@ -550,12 +551,36 @@ export const VideoStage: React.FC<VideoStageProps> = ({
    */
   useEffect(() => {
     if (tool !== 'roi' || !videoLoaded) return;
+    // 記録がもうあるなら送らない。
+    // 途中で枠を置き直すのは「今見ているコマで取り直したい」ときなので、
+    // そこで始点へ飛ばすと、何のために置き直すのか分からなくなる。
+    // （切り落としたあとは、戻した先のコマがそのまま置き場所になる）
+    if (historyData.length > 0) return;
     const v = videoRef.current;
     if (!v) return;
     if (Math.abs(v.currentTime - restartTime) < 1e-3) return;
     void goToStart();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tool, videoLoaded]);
+
+  /**
+   * 橋渡しに入ったら、残した最後のコマの次へ送る。
+   * そこが「捨てた最初のコマ」。埋めるべき最初の 1 コマ。
+   */
+  useEffect(() => {
+    if (tool !== 'bridge') { setBridgeCount(0); return; }
+    const v = videoRef.current;
+    const o = objects.find(x => x.id === selectedObjId);
+    if (!v || !o || o.initialTime === null) return;
+    v.pause();
+    setIsPlaying(false);
+    const target = o.initialTime + 1 / Math.max(1, fpsRef.current.value);
+    seekToFrameTime(v, target).then(t => {
+      frameTimeRef.current = t;
+      setCurrentTime(t);
+    }).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool]);
 
   /**
    * 初速ヒントに入ったら、枠を置いたコマから数コマ送る。
@@ -720,14 +745,16 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     const dropped = onTruncateAfter(q.time);
     setCutMsg(
       dropped > 0
-        ? `${q.time.toFixed(3)} s より後の ${dropped} コマを捨てました。`
-          + `枠を置き直すと、続けて 2 点目を聞きます`
+        ? `${q.time.toFixed(3)} s より後の ${dropped} コマを捨てました`
         : `${q.time.toFixed(3)} s まで残しました（捨てるコマはありませんでした）`
     );
     setRoiCenter(null);
     setPickIdx(null);
-    chainSeedRef.current = true;
-    setTool('roi');
+    setBridgeCount(0);
+    // 枠を置き直させるのではなく、跳ねたコマを人に指してもらう。
+    // 枠の位置は記録から分かっているので、置き直しても新しい情報は無い。
+    // 本当に足りないのは「跳ねたコマで対象はどこに居たのか」。
+    setTool('bridge');
   }, [onTruncateAfter, setTool]);
 
   const beginSingle = useCallback((pt: Point, screen: { x: number; y: number }) => {
@@ -743,6 +770,25 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       setDragCurrent(pt);
       const i = nearestPickIndex(pt, hitR);
       if (i >= 0) setPickIdx(i);
+      return;
+    }
+
+    // ---- 橋渡し ----
+    // 跳ねて捨てたコマを、人が指して埋めていく。1 コマずつ進む。
+    if (tool === 'bridge' && !isPlaying) {
+      // 指す相手は手動記録と同じ順番で決める。1 つだけ埋めてコマを進めると、
+      // もう一方の物体にだけ穴が開いた記録になる。
+      const objId = manualPick ?? nextManualTarget(
+        historyData, manualOrder, frameTimeRef.current, frameTolerance
+      ).objId ?? selectedObjId;
+      const complete = onBridgePoint(
+        objId, pt, frameTimeRef.current, videoRef.current || undefined
+      );
+      setManualPick(null);
+      if (complete) {
+        setBridgeCount(c => c + 1);
+        void stepFrame(1);
+      }
       return;
     }
 
@@ -884,6 +930,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     nearestFrameIndex, grabPoint, onUpdateCalibration, setTool,
     historyData, frameTolerance, onManualPlace, manualStep, stepFrame, isPlaying,
     manualOrder.join(','), manualPick, nearestPickIndex,
+    onBridgePoint, bridgeCount, selectedObjId,
   ]);
 
   /** 大きさを決め終えて枠を確定する */
@@ -897,27 +944,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       height: Math.round(roiSize),
     }, videoRef.current || undefined);
     setRoiCenter(null);
-    // 切った直後なら 2 点目へ続ける。ここで直接ツールを 'seed' にできない
-    // のは、枠の確定が App 側の state を経由するため。このレンダーの
-    // objects にはまだ新しい initialTime が入っておらず、送る先のコマを
-    // 間違える。印だけ立てて、反映されてから進む。
-    if (chainSeedRef.current) {
-      chainSeedRef.current = false;
-      setPendingSeed(true);
-      return;
-    }
     setTool('pan');
   }, [roiCenter, roiSize, selectedObjId, onUpdateRoi, setTool]);
-
-  // 枠が App 側へ反映されたら 2 点目へ進む
-  useEffect(() => {
-    if (!pendingSeed) return;
-    const o = objects.find(x => x.id === selectedObjId);
-    if (!o || !o.initialRoi || o.initialTime === null) return;
-    setPendingSeed(false);
-    setTool('seed');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingSeed, objects, selectedObjId]);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!videoLoaded) return;
@@ -2187,13 +2215,20 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const lost = objects.filter(o => o.active && o.status === 'lost');
   const selected = objects.find(o => o.id === selectedObjId);
 
+  /** 橋渡しで次に指す相手 */
+  const bridgeTarget = tool === 'bridge'
+    ? (manualPick ?? nextManualTarget(
+        historyData, manualOrder, frameTimeRef.current, frameTolerance
+      ).objId)
+    : null;
+
   const hint: { text: string; bg: string; color: string } | null = (() => {
     if (!videoLoaded) return null;
     // 切り落とした直後は、次にすることだけを出す
     if (cutMsg) {
       return { text: `✂ ${cutMsg}`, bg: 'rgba(16,185,129,0.95)', color: '#04221a' };
     }
-    if (tool === 'pick') return null;   // 帯の中に基準を書いている
+    if (tool === 'pick' || tool === 'bridge') return null;   // 帯の中に書いている
     if (tool === 'calib') {
       if (calibration.mode === 'plane') {
         const n = calibration.planePoints.length % 4;
@@ -2505,6 +2540,54 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             >
               <Trash2 size={15} />
               {selectedObjId} のこの点を消す
+            </button>
+          </div>
+        )}
+
+        {/* ---- 橋渡し ---- */}
+        {/*
+            跳ねて捨てたコマを、人が指して埋める。これが「枠を置き直す」の
+            代わりに要る作業。枠の位置は記録から分かっているので置き直しても
+            新しい情報は無く、足りないのは「跳ねたコマで対象はどこに居たか」。
+            指してもらえば、(1) 捨てたコマが本来の位置で埋まり、
+            (2) 最後の 2 点から再開の初速が出て、
+            (3) 難しい場面の先でテンプレートを作り直せる。
+        */}
+        {tool === 'bridge' && (
+          <div
+            className="stage__pickbar"
+            style={{ gridTemplateColumns: '1fr auto auto' }}
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
+            <div className="stage__pickbar-why">
+              捨てたコマを埋めます。
+              <b>{bridgeTarget ?? selectedObjId} の中心</b>をタップ。
+              そのコマの対象が揃うと 1 コマ進みます。2〜3 コマで「自動に戻す」。
+            </div>
+            <div className="stage__pickbar-info">
+              <b className="mono">{bridgeCount} 点</b>
+              <span>{currentTime.toFixed(3)} s</span>
+            </div>
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={bridgeCount < 2}
+              onClick={() => {
+                const r = onBridgeFinish(videoRef.current || undefined);
+                setSeedMsg(r.msg ? r : null);
+                setBridgeCount(0);
+                setTool('pan');
+              }}
+            >
+              <Play size={14} />
+              自動に戻す
+            </button>
+            <button
+              className="btn btn-icon btn-sm btn-secondary"
+              aria-label="やめる"
+              onClick={() => { setBridgeCount(0); setTool('pan'); }}
+            >
+              <XCircle size={16} />
             </button>
           </div>
         )}
