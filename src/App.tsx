@@ -44,10 +44,11 @@ import { CalibSheet } from './components/sheets/CalibSheet';
 import { TuneSheet } from './components/sheets/TuneSheet';
 import { DataSheet } from './components/sheets/DataSheet';
 import { TrimSheet } from './components/sheets/TrimSheet';
+import { AnalysisSheet } from './components/sheets/AnalysisSheet';
 import { AxisKey } from './components/MotionGraph';
 import { DEFAULT_SMOOTH_WINDOW } from './utils/graphSmooth';
 
-import { Layers, Ruler, SlidersHorizontal, LineChart, X, Scissors } from 'lucide-react';
+import { Layers, Ruler, SlidersHorizontal, LineChart, X, Scissors, Sigma } from 'lucide-react';
 
 // -------------------------------------------------
 // 定数
@@ -78,7 +79,7 @@ const makeDefaultObjects = (): TrackedObject[] =>
  *  スマホは PC より余裕がないので Ver.2 の 200ms より少し長く取る。 */
 const HISTORY_FLUSH_MS = 300;
 
-type TabId = 'trim' | 'objects' | 'calib' | 'tune' | 'data';
+type TabId = 'trim' | 'objects' | 'calib' | 'tune' | 'data' | 'fit';
 
 const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
   // 並びがそのまま作業順になっている（トリム → 対象 → 校正 → 設定 → データ）
@@ -87,6 +88,8 @@ const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
   { id: 'calib', label: '校正', icon: <Ruler size={19} /> },
   { id: 'tune', label: '設定', icon: <SlidersHorizontal size={19} /> },
   { id: 'data', label: 'データ', icon: <LineChart size={19} /> },
+  // 解析は最後。データが取れているのを確かめてから数値を出す順番になる
+  { id: 'fit', label: '解析', icon: <Sigma size={19} /> },
 ];
 
 // -------------------------------------------------
@@ -1487,6 +1490,19 @@ export const App: React.FC = () => {
                 graphSmoothWindow={graphSmoothWindow}
                 onChangeGraphSmooth={setGraphSmooth}
                 onChangeGraphSmoothWindow={setGraphSmoothWindow}
+              />
+            )}
+            {tab === 'fit' && (
+              <AnalysisSheet
+                objects={objects}
+                selectedObjId={selectedObjId}
+                onSelectObjId={setSelectedObjId}
+                historyData={historyData}
+                timeRange={timeRange}
+                fpsSettings={fpsSettings}
+                calibration={calibration}
+                videoLoaded={videoLoaded}
+                onSeek={handleSeek}
               />
             )}
           </div>
