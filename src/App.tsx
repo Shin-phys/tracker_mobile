@@ -150,7 +150,15 @@ export const App: React.FC = () => {
   const [tool, setTool] = useState<StageTool>('roi');
   const [roiSize, setRoiSize] = useState(40);
   const [calibHandle, setCalibHandle] = useState(0);
-  const [tab, setTab] = useState<TabId>('objects');
+  /**
+   * 最初に開いているタブ。
+   *
+   * トリムから始める。手順が「終点を決める → 始点へ戻る → そのコマで枠を置く」
+   * の順に進むと、枠を置いたコマと区間の始点が一致する。対象タブから始めると、
+   * 枠を置いてから区間を決めることになり、始点と枠のコマが食い違う。
+   * 警告を出して後追いしていた事故が、並び順だけで起きなくなる。
+   */
+  const [tab, setTab] = useState<TabId>('trim');
   /** グラフのタップから動画をシークさせるための指示 */
   const [seekRequest, setSeekRequest] = useState<{ t: number; n: number } | null>(null);
   /** 追跡が暴れたときに再生を止めるための合図（増えるたびに止める） */
@@ -287,6 +295,13 @@ export const App: React.FC = () => {
     seekSeqRef.current += 1;
     setSeekRequest({ t, n: seekSeqRef.current });
   }, []);
+
+  // 動画を選び直したら、またトリムから始める。
+  // 区間は「この動画の何秒から何秒まで」なので、別の動画では引き継げない。
+  // 前の動画の作業の途中（データタブなど）に残しておく意味がない。
+  useEffect(() => {
+    if (videoLoaded) setTab('trim');
+  }, [videoLoaded]);
 
   const openTab = (id: TabId) => {
     const pts = snapPoints();
