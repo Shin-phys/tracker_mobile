@@ -15,6 +15,9 @@ import { Card, Slider, Switch } from '../ui';
 import { Settings2, RotateCcw, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface Props {
+  /** 次にやることを 1 行で出す帯を表示するか */
+  guideOn: boolean;
+  onChangeGuideOn: (v: boolean) => void;
   tracking: TrackingSettings;
   onUpdateTracking: (t: TrackingSettings) => void;
   onResetData: () => void;
@@ -26,12 +29,21 @@ const MARKER_MODES: { id: MarkerMode; label: string }[] = [
 ];
 
 export const TuneSheet: React.FC<Props> = ({
-  tracking, onUpdateTracking, onResetData,
+  tracking, onUpdateTracking, onResetData, guideOn, onChangeGuideOn,
 }) => {
   const [advanced, setAdvanced] = useState(false);
 
   return (
     <>
+      <Card title="ガイド">
+        <Switch
+          checked={guideOn}
+          onChange={onChangeGuideOn}
+          label="次にやることを画面の上に出す"
+          hint="状態から導いているだけなので、順番を飛ばしても勝手に追いつきます"
+        />
+      </Card>
+
       {/* ---- 追跡の詳細設定 ---- */}
       <Card
         title={<><Settings2 size={16} color="var(--accent-primary)" />追跡の詳細設定</>}

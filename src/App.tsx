@@ -33,6 +33,7 @@ import {
 } from './utils/manualTrack';
 import {
   TimeRange, FULL_RANGE, inRange, normalizeRange, trackedPointAt, trackedStepAt,
+  countInRange, MIN_RANGE_POINTS,
 } from './utils/timeRange';
 import { recentStep } from './utils/frameCheck';
 import { truncateAfter, dropPointAt, clearSuspect, pointsBefore } from './utils/trailEdit';
@@ -45,6 +46,7 @@ import { TuneSheet } from './components/sheets/TuneSheet';
 import { DataSheet } from './components/sheets/DataSheet';
 import { TrimSheet } from './components/sheets/TrimSheet';
 import { AnalysisSheet } from './components/sheets/AnalysisSheet';
+import { GuideBar, GuideStep } from './components/GuideBar';
 import { AxisKey } from './components/MotionGraph';
 import { DEFAULT_SMOOTH_WINDOW } from './utils/graphSmooth';
 
@@ -162,6 +164,14 @@ export const App: React.FC = () => {
    * 警告を出して後追いしていた事故が、並び順だけで起きなくなる。
    */
   const [tab, setTab] = useState<TabId>('trim');
+  /**
+   * ガイドを出すか。既定は ON。
+   * ひと通り終わったら自分で閉じてもらう（勝手に消すと、やり直したいときに
+   * 戻す手段が分からなくなる）。
+   */
+  const [guideOn, setGuideOn] = useState(true);
+  /** とばした手順。速い対象だけに必要な手順があるので、逃げ道が要る */
+  const [guideSkipped, setGuideSkipped] = useState<string[]>([]);
   /** グラフのタップから動画をシークさせるための指示 */
   const [seekRequest, setSeekRequest] = useState<{ t: number; n: number } | null>(null);
   /** 追跡が暴れたときに再生を止めるための合図（増えるたびに止める） */
@@ -303,7 +313,10 @@ export const App: React.FC = () => {
   // 区間は「この動画の何秒から何秒まで」なので、別の動画では引き継げない。
   // 前の動画の作業の途中（データタブなど）に残しておく意味がない。
   useEffect(() => {
-    if (videoLoaded) setTab('trim');
+    if (!videoLoaded) return;
+    setTab('trim');
+    // 別の動画なら手順はやり直しなので、とばした記録も戻す
+    setGuideSkipped([]);
   }, [videoLoaded]);
 
   const openTab = (id: TabId) => {
@@ -1329,6 +1342,90 @@ export const App: React.FC = () => {
 
   const tabTitle = TABS.find(t => t.id === tab);
 
+  // -------------------------------------------------
+  // ガイドの手順
+  // -------------------------------------------------
+  //
+  // 状態から導くだけで、別の状態を持たない。「今どのステップか」を
+  // 自分で覚えると、順番を飛ばしたときやり直したときに必ず食い違う
+  // （ステップ 5 を出しながら枠が無い、のような状態が作れてしまう）。
+  // 毎回状態を見て「まだ終わっていない最初のこと」を出すので、
+  // やれば勝手に進み、やり直せば勝手に戻る。「次へ」ボタンは要らない。
+  //
+  // 並びは、事故が手順だけで起きなくなるように決めてある。
+  // 終点 → 始点 → 枠、の順に進むと、枠を置いたコマと区間の始点が一致する。
+  const guideSteps: GuideStep[] = (() => {
+    const sel = objects.find(o => o.id === selectedObjId) ?? objects[0];
+    const calibrated = calibration.mode === 'plane'
+      ? calibration.homography !== null
+      : calibration.pxPerUnit > 0;
+    const pointsInRange = countInRange(historyData, timeRange);
+    const go = (id: TabId, tool?: StageTool) => () => {
+      setTab(id);
+      setSheetH(snapPoints()[1]);
+      if (tool) setTool(tool);
+    };
+    return [
+      {
+        id: 'video',
+        what: '動画を選ぶ',
+        done: videoLoaded,
+      },
+      {
+        id: 'end',
+        what: '終わりまで再生して、終点を決める',
+        done: timeRange.end !== null,
+        go: go('trim'),
+      },
+      {
+        id: 'start',
+        what: '運動が始まるコマへ戻して、始点を決める',
+        done: timeRange.start !== null,
+        go: go('trim'),
+      },
+      {
+        id: 'roi',
+        what: `${selectedObjId} の中心を押して、枠を置く`,
+        done: !!sel?.initialRoi,
+        go: go('objects', 'roi'),
+      },
+      {
+        id: 'seed',
+        what: '速い対象なら、数コマ先でもう一度指す（2 点目）',
+        done: !!sel?.seed,
+        optional: true,
+        go: go('objects', 'seed'),
+      },
+      {
+        id: 'calib',
+        what: '長さの分かるものを指して、スケールを決める',
+        done: calibrated,
+        go: go('calib'),
+      },
+      {
+        id: 'play',
+        what: '再生して追跡する',
+        done: pointsInRange >= MIN_RANGE_POINTS,
+        // 行き先はタブではなく「シートを畳んで映像と再生バーを出す」
+        go: () => setSheetH(0),
+      },
+      {
+        id: 'fps',
+        what: 'スロー撮影なら、撮影フレームレートを入れる',
+        done: fpsSettings.captureFps > 0,
+        optional: true,
+        go: go('data'),
+      },
+      {
+        id: 'fit',
+        what: '解析タブで当てはめて、数値を読む',
+        // 開いたら済みとみなす。ここだけ別の状態を持たせずに完了を判定できる
+        done: tab === 'fit',
+        go: go('fit'),
+      },
+    ];
+  })();
+
   return (
     <div className="app">
       <TopBar
@@ -1338,6 +1435,15 @@ export const App: React.FC = () => {
         totalDataCount={historyData.length}
         fps={fpsSettings.value}
       />
+
+      {guideOn && (
+        <GuideBar
+          steps={guideSteps}
+          skipped={guideSkipped}
+          onSkip={id => setGuideSkipped(prev => [...prev, id])}
+          onClose={() => setGuideOn(false)}
+        />
+      )}
 
       <VideoStage
         objects={objects}
@@ -1466,6 +1572,8 @@ export const App: React.FC = () => {
                 tracking={tracking}
                 onUpdateTracking={setTracking}
                 onResetData={handleResetData}
+                guideOn={guideOn}
+                onChangeGuideOn={setGuideOn}
               />
             )}
             {tab === 'data' && (

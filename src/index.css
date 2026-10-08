@@ -1198,3 +1198,74 @@ input[type='range']:disabled {
     --tabbar-h: 48px;
   }
 }
+
+/* ---- ガイド（次にやることを 1 行で出す帯） ---- */
+.guidebar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px 5px 10px;
+  background: rgba(99, 102, 241, 0.14);
+  border-bottom: 1px solid rgba(99, 102, 241, 0.3);
+  font-size: 0.74rem;
+  min-height: 32px;
+}
+
+.guidebar--done {
+  background: rgba(16, 185, 129, 0.14);
+  border-bottom-color: rgba(16, 185, 129, 0.3);
+  color: #6ee7b7;
+}
+
+.guidebar__step {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--accent-primary);
+  flex-shrink: 0;
+}
+
+.guidebar__what {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  color: var(--text-primary);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.guidebar__go {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 600;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.guidebar__go:disabled {
+  cursor: default;
+}
+
+.guidebar__skip,
+.guidebar__x {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.7rem;
+  padding: 4px 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+
+.guidebar__skip {
+  text-decoration: underline;
+}
