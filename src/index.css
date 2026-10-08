@@ -239,6 +239,33 @@ body {
   z-index: 7;
 }
 
+/* 追跡が飛んで止まったときの案内。
+   選択肢をボタンで並べるので、ヒント帯ではなくパネルにしている。
+   下寄せなのは、映像の上側に軌跡と候補点が出るため。 */
+.stage__haltbar {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  width: min(320px, calc(100% - 28px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border-radius: 12px;
+  background: rgba(8, 13, 26, 0.95);
+  border: 1.5px solid rgba(239, 68, 68, 0.55);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.65);
+  z-index: 7;
+}
+
+.stage__haltbar-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #fca5a5;
+  line-height: 1.45;
+}
+
 /* 指で隠れる位置を拡大表示する虫めがね */
 .loupe {
   position: absolute;

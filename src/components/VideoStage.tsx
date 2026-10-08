@@ -20,7 +20,7 @@
 
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import {
-  TrackedObject, ScaleCalibration, Rect, Point, FrameData, FpsSettings,
+  TrackedObject, ScaleCalibration, Rect, Point, FrameData, FpsSettings, HaltInfo,
 } from '../types';
 import { recalcScale, pixelDistance } from '../utils/calibration';
 import { applyHomography, invertHomography, Matrix3 } from '../utils/homography';
@@ -35,6 +35,7 @@ import { timeScale } from '../utils/timeScale';
 import { drawCrosshair, drawCalibPoint } from '../utils/overlay';
 import { SEED_FRAMES } from '../types';
 import { checkTrack } from '../utils/frameCheck';
+import { pointsBefore, TrailPoint } from '../utils/trailEdit';
 import {
   TimeRange, FULL_RANGE, hasRange, rangeStart, rangeEnd, rangeSpan,
   countInRange, MIN_RANGE_POINTS,
@@ -45,10 +46,10 @@ import {
   MousePointerClick, Undo2,
   ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Route, SkipBack,
   ChevronUp, ChevronDown,
-  Scissors, CornerDownLeft, CornerDownRight, XCircle, ListVideo,
+  Scissors, CornerDownLeft, CornerDownRight, XCircle, ListVideo, Trash2,
 } from 'lucide-react';
 
-export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual' | 'seed';
+export type StageTool = 'pan' | 'roi' | 'correct' | 'calib' | 'origin' | 'manual' | 'seed' | 'pick';
 
 interface VideoStageProps {
   objects: TrackedObject[];
@@ -64,6 +65,18 @@ interface VideoStageProps {
   onSeedPoint: (objId: string, point: Point, fileTime: number) => string;
   /** 追跡が暴れたときの一時停止要求。増えるたびに止める */
   pauseAt: number;
+  /** 追跡が飛んで止めた、という事実。null なら何も起きていない */
+  halt: HaltInfo | null;
+  /** keepUntil のコマまでを残し、それより後を捨てる。戻り値は捨てたコマ数 */
+  onTruncateAfter: (keepUntil: number) => number;
+  /** 1 点だけ消す。グラフを見て後から外れ値に気づいたとき用 */
+  onDropPoint: (objId: string, t: number) => boolean;
+  /**
+   * 止めた案内を閉じる。
+   * accept=true は「誤検出だった」＝印を外して当分検出を見送る。
+   * false は「自分で直す」＝印は残したまま案内だけ閉じる。
+   */
+  onDismissHalt: (accept: boolean) => void;
   /** 枠の中心を決めている間を知らせる。シートを畳んで映像を広げてもらう */
   onAimingChange: (aiming: boolean) => void;
   /** トリムタブを開いているか。開いている間だけ再生バーに区間の操作を出す */
@@ -111,6 +124,8 @@ const HANDLE_TOUCH_PX = 26;
 /** これ未満の移動は「タップ」とみなす（画面ピクセル） */
 const TAP_SLOP_PX = 9;
 /** 虫めがねの倍率 */
+/** 「ここまでは正しい」を選ばせる候補の数 */
+const PICK_POINTS = 24;
 const LOUPE_MAG = 3;
 const LOUPE_SIZE = 104;
 
@@ -147,6 +162,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   objects, selectedObjId, onUpdateRoi, onManualCorrect, onManualPlace, onManualUndo,
   calibration, onUpdateCalibration, onProcessFrame,
   onSeedPoint, trimMode, pauseAt, onAimingChange,
+  halt, onTruncateAfter, onDismissHalt, onDropPoint,
   historyData, onResetData, onClearTrail, onFlushHistory, isPlaying, setIsPlaying,
   fpsSettings, setFpsSettings, isLineCalibrating, setIsLineCalibrating,
   onVideoSize, onVideoDuration, onVideoLoaded, tool, setTool, roiSize, setRoiSize,
@@ -204,6 +220,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
    * 決める、の 2 段階に分けている。
    */
   const [roiCenter, setRoiCenter] = useState<Point | null>(null);
+  /** 切り落としたあとの一言 */
+  const [cutMsg, setCutMsg] = useState<string | null>(null);
   /**
    * いま表示されているフレームの実時刻（mediaTime）。
    * 「要求した時刻」ではなくブラウザが実際に見せたフレームの時刻なので、
@@ -593,8 +611,69 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   // ポインタ操作
   // =========================================================
 
+  /**
+   * 「ここまでは正しい」の候補。飛んだ時刻の手前の記録点を新しい順に並べる。
+   *
+   * 時刻の数字ではなく映像の上の点として選ばせる。どこでドリフトが
+   * 始まったかは軌跡の形を見れば分かるが、秒数の一覧からは分からない。
+   */
+  const pickPoints = useMemo<TrailPoint[]>(
+    () => (halt ? pointsBefore(historyData, halt.objId, halt.time, PICK_POINTS) : []),
+    [halt, historyData]
+  );
+
+  /** 候補のうち、移動量が普段から外れ始めるのはどこからか */
+  const pickMedianStep = useMemo(() => {
+    const steps = pickPoints.map(q => q.step).filter(v => v > 0).sort((a, b) => a - b);
+    return steps.length > 0 ? steps[Math.floor(steps.length / 2)] : 0;
+  }, [pickPoints]);
+
+  /** 切り落としの一言は少し長めに出す（次にすることが書いてある） */
+  useEffect(() => {
+    if (!cutMsg) return;
+    const id = window.setTimeout(() => setCutMsg(null), 6000);
+    return () => window.clearTimeout(id);
+  }, [cutMsg]);
+
+  /** 指に近い候補点。指は太いので、枠のハンドルと同じ広さで拾う */
+  const nearestPick = useCallback(
+    (pt: Point, hitR: number): TrailPoint | null => {
+      let best: TrailPoint | null = null;
+      let bestD = hitR * 1.6;
+      pickPoints.forEach(q => {
+        const d = pixelDistance(pt, q.point);
+        if (d < bestD) { bestD = d; best = q; }
+      });
+      return best;
+    },
+    [pickPoints]
+  );
+
+  /**
+   * 切り落とす。クリックした点より後の記録を捨て、枠をその位置へ戻す。
+   * そのまま枠を置き直せるよう、ツールは枠指定へ送る。
+   */
+  const cutAt = useCallback((q: TrailPoint) => {
+    const dropped = onTruncateAfter(q.time);
+    setCutMsg(
+      dropped > 0
+        ? `${q.time.toFixed(3)} s より後の ${dropped} コマを捨てました。枠を置き直してください`
+        : `${q.time.toFixed(3)} s まで残しました（捨てるコマはありませんでした）`
+    );
+    setRoiCenter(null);
+    setTool('roi');
+  }, [onTruncateAfter, setTool]);
+
   const beginSingle = useCallback((pt: Point, screen: { x: number; y: number }) => {
     const hitR = HANDLE_TOUCH_PX * canvasPerScreen();
+
+    // ---- 「ここまでは正しい」を選ぶ ----
+    // ほかのどのツールよりも先に見る。選び終わるまで他の操作はさせない。
+    if (tool === 'pick') {
+      const q = nearestPick(pt, hitR);
+      if (q) cutAt(q);
+      return;
+    }
 
     // ---- 手動トラッキング ----
     // タップした位置がそのままその物体・そのコマの記録になる。
@@ -733,7 +812,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     tool, calibration, objects, canvasPerScreen, setCalibHandle, isLineCalibrating,
     nearestFrameIndex, grabPoint, onUpdateCalibration, setTool,
     historyData, frameTolerance, onManualPlace, manualStep, stepFrame, isPlaying,
-    manualOrder.join(','), manualPick,
+    manualOrder.join(','), manualPick, nearestPick, cutAt,
   ]);
 
   /** 大きさを決め終えて枠を確定する */
@@ -1030,7 +1109,9 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         let cur: Point[] = [];
         for (let i = 0; i < historyData.length; i++) {
           const item = historyData[i].objects[obj.id];
-          if (item && !item.lost) cur.push({ x: item.xPx, y: item.yPx });
+          // 飛んだと判定した点でも線を切る。点そのものは ✕ で別に描く。
+          // つないでしまうと、壊れた区間まで滑らかな運動に見える。
+          if (item && !item.lost && !item.suspect) cur.push({ x: item.xPx, y: item.yPx });
           else if (cur.length > 0) { segments.push(cur); cur = []; }
         }
         if (cur.length > 0) segments.push(cur);
@@ -1079,6 +1160,28 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           }
         }
 
+        // 飛んだと判定した点は ✕ で描く。
+        // 丸ではなく ✕ にしてあるのは、「これは軌跡の一部ではない」
+        // ことを形で示したいから。乱れの印（点線の輪）とは別物。
+        for (let i = 0; i < historyData.length; i++) {
+          const it = historyData[i].objects[obj.id];
+          if (!it || !it.suspect) continue;
+          const r = 7 * k;
+          ctx.save();
+          ctx.lineCap = 'round';
+          const cross = (color: string, w: number) => {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = w;
+            ctx.beginPath();
+            ctx.moveTo(it.xPx - r, it.yPx - r); ctx.lineTo(it.xPx + r, it.yPx + r);
+            ctx.moveTo(it.xPx + r, it.yPx - r); ctx.lineTo(it.xPx - r, it.yPx + r);
+            ctx.stroke();
+          };
+          cross('rgba(0,0,0,0.55)', 4.4 * k);
+          cross('#ef4444', 2.2 * k);
+          ctx.restore();
+        }
+
         for (let i = 0; i < historyData.length; i++) {
           const it = historyData[i].objects[obj.id];
           if (it && it.manual && !it.lost) {
@@ -1108,6 +1211,34 @@ export const VideoStage: React.FC<VideoStageProps> = ({
           ctx.setLineDash([]);
         }
       });
+    }
+
+    // ----- 「ここまでは正しい」の候補 -----
+    //
+    // 移動量が普段から外れ始めたところより後を濃い赤、手前を橙で描く。
+    // どこから色が変わるかが、そのまま「ドリフトが始まったあたり」になる。
+    if (tool === 'pick' && pickPoints.length > 0) {
+      const warnFrom = (() => {
+        if (pickMedianStep <= 0) return pickPoints.length;
+        for (let i = 0; i < pickPoints.length; i++) {
+          if (pickPoints[i].step > Math.max(pickMedianStep * 2, pickMedianStep + 4)) {
+            return i;
+          }
+        }
+        return pickPoints.length;
+      })();
+      ctx.save();
+      pickPoints.forEach((q, i) => {
+        const warn = i >= warnFrom;
+        ctx.beginPath();
+        ctx.arc(q.point.x, q.point.y, 7 * k, 0, Math.PI * 2);
+        ctx.fillStyle = warn ? 'rgba(239,68,68,0.9)' : 'rgba(245,158,11,0.85)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+        ctx.lineWidth = 1.6 * k;
+        ctx.stroke();
+      });
+      ctx.restore();
     }
 
     // ----- ROI 枠 -----
@@ -1492,7 +1623,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     historyData, objects, selectedObjId, showTrail, gesture, dragStart, dragCurrent,
     calibration, tool, isPlaying, roiSize, linePending, calibHandle,
     canvasPerScreen, view.z, nearestFrameIndex, grabPoint, frameTolerance, issueTimes,
-    roiCenter,
+    roiCenter, pickPoints, pickMedianStep,
   ]);
 
   renderRef.current = renderFrame;
@@ -1763,6 +1894,20 @@ export const VideoStage: React.FC<VideoStageProps> = ({
    * 記録が始まるコマへ送るだけ。軌跡は消さない。
    * やり直し（↺）と混同されていたので、別のボタンに分けた。
    */
+  /** 指定した時刻のコマへ送る（止めた点を手で直すときに使う） */
+  const seekToTime = useCallback(async (t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause();
+    setIsPlaying(false);
+    try {
+      const got = await seekToFrameTime(v, t);
+      frameTimeRef.current = got;
+      setCurrentTime(got);
+    } catch (_) { /* シークに失敗しても状態は壊さない */ }
+    renderRef.current();
+  }, [setIsPlaying]);
+
   const goToStart = useCallback(async () => {
     const v = videoRef.current;
     if (!v) return;
@@ -1896,6 +2041,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   const hint: { text: string; bg: string; color: string } | null = (() => {
     if (!videoLoaded) return null;
+    // 切り落とした直後は、次にすることだけを出す
+    if (cutMsg) {
+      return { text: `✂ ${cutMsg}`, bg: 'rgba(16,185,129,0.95)', color: '#04221a' };
+    }
+    if (tool === 'pick') return null;   // 案内はパネルの方に出している
     if (tool === 'calib') {
       if (calibration.mode === 'plane') {
         const n = calibration.planePoints.length % 4;
@@ -2178,6 +2328,106 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               <b>マーカー全体が入る大きさ</b>に。内側だけだと、光の反射や回転で滑ります。
               映像をもう一度押せば中心を置き直せます。
             </div>
+          </div>
+        )}
+
+        {/* ---- 修正モードの操作 ---- */}
+        {/*
+            直せない点もある。対象が別のものに完全に乗り移った、
+            物体が隠れて写っていない、といった場合は正しい位置が存在しない。
+            そういう点はドラッグでは直せないので、消す口が要る。
+            当てはめも 2 階差分も、1 点の跳ねで台無しになる。
+        */}
+        {videoLoaded && tool === 'correct' && !isPlaying && !halt && (
+          <div
+            className="stage__sizebar fade-in"
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
+            <button
+              className="btn btn-secondary btn-sm"
+              style={{ width: '100%' }}
+              onClick={() => {
+                const v = videoRef.current;
+                const ok = onDropPoint(selectedObjId, v ? v.currentTime : 0);
+                setCorrectMsg(
+                  ok ? 'このコマの点を消しました' : 'このコマに消せる点がありません'
+                );
+              }}
+            >
+              <Trash2 size={15} />
+              {selectedObjId} のこの点を消す
+            </button>
+          </div>
+        )}
+
+        {/* ---- 追跡が飛んで止まったときの案内 ---- */}
+        {halt && tool !== 'pick' && (
+          <div
+            className="stage__haltbar fade-in"
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
+            <div className="stage__haltbar-title">
+              {halt.objId}: {halt.time.toFixed(3)} s で追跡が飛びました
+            </div>
+            <div className="hint" style={{ margin: 0 }}>
+              1 コマ {Math.round(halt.step)}px・直前までは {Math.round(halt.base)}px
+              {halt.atEdge && '・探索窓の縁'}。このコマに ✕ を付けて軌跡を切りました。
+              ずれは数コマ前から始まっていることが多いので、戻す位置を選んでください。
+            </div>
+            <button
+              className="btn btn-primary btn-sm"
+              style={{ width: '100%' }}
+              onClick={() => setTool('pick')}
+            >
+              <Scissors size={15} />
+              ここから取り直す
+            </button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ flex: 1 }}
+                onClick={() => {
+                  onDismissHalt(false);
+                  setTool('correct');
+                  void seekToTime(halt.time);
+                }}
+              >
+                手で直す
+              </button>
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ flex: 1 }}
+                onClick={() => onDismissHalt(true)}
+              >
+                誤検出・続ける
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ---- どこまで戻すかを選ぶ ---- */}
+        {tool === 'pick' && (
+          <div
+            className="stage__haltbar fade-in"
+            onPointerDown={e => e.stopPropagation()}
+            onPointerUp={e => e.stopPropagation()}
+          >
+            <div className="stage__haltbar-title" style={{ color: 'var(--color-warning)' }}>
+              正しい最後の点をタップ
+            </div>
+            <div className="hint" style={{ margin: 0 }}>
+              赤い点は、そこまでの移動量が普段から外れているコマです。
+              タップした点より後の記録を捨てて、枠をその位置へ戻します。
+            </div>
+            <button
+              className="btn btn-secondary btn-sm"
+              style={{ width: '100%' }}
+              onClick={() => { onDismissHalt(false); setTool('pan'); }}
+            >
+              やめる
+            </button>
           </div>
         )}
 
