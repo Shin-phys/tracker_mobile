@@ -148,6 +148,7 @@ type Gesture =
   | { kind: 'pan' }
   | { kind: 'roi' }
   | { kind: 'seed' }
+  | { kind: 'pick' }
   | { kind: 'manual'; objId: string }
   | { kind: 'calib-new' }
   | { kind: 'calib-handle'; index: number };
@@ -222,6 +223,14 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [roiCenter, setRoiCenter] = useState<Point | null>(null);
   /** 切り落としたあとの一言 */
   const [cutMsg, setCutMsg] = useState<string | null>(null);
+  /**
+   * 「ここまでは正しい」で選んでいる候補の番号。
+   *
+   * 選ぶだけでは切らない。選ぶとそのコマへ送るので、点がマーカーの上に
+   * 乗っているかを目で確かめてから決定できる。確かめられないと、
+   * どれが正解なのか人には分からない。
+   */
+  const [pickIdx, setPickIdx] = useState<number | null>(null);
   /**
    * いま表示されているフレームの実時刻（mediaTime）。
    * 「要求した時刻」ではなくブラウザが実際に見せたフレームの時刻なので、
@@ -628,6 +637,31 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     return steps.length > 0 ? steps[Math.floor(steps.length / 2)] : 0;
   }, [pickPoints]);
 
+  /**
+   * 乱れ始めた最初の候補。ここから後は信用しない。
+   *
+   * 候補の数と等しければ、候補の中では乱れが見つからなかったということ。
+   */
+  const pickWarnFrom = useMemo(() => {
+    if (pickMedianStep <= 0) return pickPoints.length;
+    for (let i = 0; i < pickPoints.length; i++) {
+      if (pickPoints[i].step > Math.max(pickMedianStep * 2, pickMedianStep + 4)) return i;
+    }
+    return pickPoints.length;
+  }, [pickPoints, pickMedianStep]);
+
+  /**
+   * アプリ側の答え。乱れ始めた 1 つ手前。
+   *
+   * 既定を入れておくのが肝。「正しい最後の点を選べ」と言われても、
+   * 何を基準に選ぶのかが分からなければ手が止まる。まず答えを置いて、
+   * 違うと思ったときだけ動かしてもらう形にする。
+   */
+  const pickSuggest = useMemo(() => {
+    if (pickPoints.length === 0) return null;
+    return Math.max(0, Math.min(pickPoints.length - 1, pickWarnFrom - 1));
+  }, [pickPoints, pickWarnFrom]);
+
   /** 切り落としの一言は少し長めに出す（次にすることが書いてある） */
   useEffect(() => {
     if (!cutMsg) return;
@@ -635,14 +669,19 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     return () => window.clearTimeout(id);
   }, [cutMsg]);
 
-  /** 指に近い候補点。指は太いので、枠のハンドルと同じ広さで拾う */
-  const nearestPick = useCallback(
-    (pt: Point, hitR: number): TrailPoint | null => {
-      let best: TrailPoint | null = null;
+  /**
+   * 指に近い候補の番号。見つからなければ -1。
+   *
+   * 指は太いので、枠のハンドルと同じ広さで拾う。候補は軌跡の上に
+   * 密に並ぶので、なぞって選び直せるほうが現実的。
+   */
+  const nearestPickIndex = useCallback(
+    (pt: Point, hitR: number): number => {
+      let best = -1;
       let bestD = hitR * 1.6;
-      pickPoints.forEach(q => {
+      pickPoints.forEach((q, i) => {
         const d = pixelDistance(pt, q.point);
-        if (d < bestD) { bestD = d; best = q; }
+        if (d < bestD) { bestD = d; best = i; }
       });
       return best;
     },
@@ -650,7 +689,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   );
 
   /**
-   * 切り落とす。クリックした点より後の記録を捨て、枠をその位置へ戻す。
+   * 切り落とす。選んだ点より後の記録を捨て、枠をその位置へ戻す。
    * そのまま枠を置き直せるよう、ツールは枠指定へ送る。
    */
   const cutAt = useCallback((q: TrailPoint) => {
@@ -661,6 +700,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         : `${q.time.toFixed(3)} s まで残しました（捨てるコマはありませんでした）`
     );
     setRoiCenter(null);
+    setPickIdx(null);
     setTool('roi');
   }, [onTruncateAfter, setTool]);
 
@@ -669,9 +709,14 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     // ---- 「ここまでは正しい」を選ぶ ----
     // ほかのどのツールよりも先に見る。選び終わるまで他の操作はさせない。
+    //
+    // タップでは切らない。選ぶだけにして、そのコマへ送って見せる。
+    // 指は太いので、押したまま軌跡をなぞって選び直せるようにもしてある。
     if (tool === 'pick') {
-      const q = nearestPick(pt, hitR);
-      if (q) cutAt(q);
+      setGesture({ kind: 'pick' });
+      setDragCurrent(pt);
+      const i = nearestPickIndex(pt, hitR);
+      if (i >= 0) setPickIdx(i);
       return;
     }
 
@@ -812,7 +857,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     tool, calibration, objects, canvasPerScreen, setCalibHandle, isLineCalibrating,
     nearestFrameIndex, grabPoint, onUpdateCalibration, setTool,
     historyData, frameTolerance, onManualPlace, manualStep, stepFrame, isPlaying,
-    manualOrder.join(','), manualPick, nearestPick, cutAt,
+    manualOrder.join(','), manualPick, nearestPickIndex,
   ]);
 
   /** 大きさを決め終えて枠を確定する */
@@ -893,6 +938,12 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     const pt = toCanvasPt(e.clientX, e.clientY);
     setDragCurrent(pt);
+
+    if (gesture.kind === 'pick') {
+      const i = nearestPickIndex(pt, HANDLE_TOUCH_PX * canvasPerScreen());
+      if (i >= 0) setPickIdx(i);
+      return;
+    }
 
     if (gesture.kind === 'calib-handle' && gesture.index >= 0) {
       if (calibration.mode === 'line' && calibration.linePoints.length === 2) {
@@ -999,14 +1050,33 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   // 虫めがね
   // =========================================================
 
+  /**
+   * 虫めがねの中心。
+   *
+   * 指でなぞっている間はその位置、「ここまでは正しい」を選んでいる間は
+   * 選択中の候補。候補を選ぶのは「点がマーカーの上に乗っているか」の
+   * 判断なので、拡大が無いと決められない。
+   */
+  const loupeFocus: Point | null = (() => {
+    if (dragCurrent && gesture && gesture.kind !== 'pan') {
+      return gesture.kind === 'pick' && pickIdx !== null && pickPoints[pickIdx]
+        ? pickPoints[pickIdx].point
+        : dragCurrent;
+    }
+    if (tool === 'pick' && pickIdx !== null && pickPoints[pickIdx]) {
+      return pickPoints[pickIdx].point;
+    }
+    return null;
+  })();
+
   const loupePos = (() => {
-    if (!gesture || gesture.kind === 'pan' || !dragCurrent) return null;
+    if (!loupeFocus) return null;
     const canvas = canvasRef.current;
     const stage = stageRef.current;
     if (!canvas || !stage) return null;
     const cr = canvas.getBoundingClientRect();
     const sr = stage.getBoundingClientRect();
-    const screenX = cr.left + (dragCurrent.x / canvas.width) * cr.width - sr.left;
+    const screenX = cr.left + (loupeFocus.x / canvas.width) * cr.width - sr.left;
     // 指と重ならないよう、触っている側と反対の上隅に出す
     const left = screenX > sr.width / 2 ? 10 : sr.width - LOUPE_SIZE - 10;
     return { left, top: 10 };
@@ -1015,14 +1085,14 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const drawLoupe = useCallback(() => {
     const lc = loupeRef.current;
     const canvas = canvasRef.current;
-    if (!lc || !canvas || !dragCurrent) return;
+    if (!lc || !canvas || !loupeFocus) return;
     const ctx = lc.getContext('2d');
     if (!ctx) return;
     const r = canvas.getBoundingClientRect();
     const dispScale = r.width > 0 ? r.width / canvas.width : 1; // 画面px / 動画px
     const srcSize = LOUPE_SIZE / Math.max(0.001, dispScale * LOUPE_MAG);
-    const sx = dragCurrent.x - srcSize / 2;
-    const sy = dragCurrent.y - srcSize / 2;
+    const sx = loupeFocus.x - srcSize / 2;
+    const sy = loupeFocus.y - srcSize / 2;
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
     ctx.imageSmoothingEnabled = false;
@@ -1043,7 +1113,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     ctx.beginPath();
     ctx.arc(c, c, 2.5, 0, Math.PI * 2);
     ctx.stroke();
-  }, [dragCurrent]);
+  }, [loupeFocus]);
 
   // =========================================================
   // 描画
@@ -1218,26 +1288,32 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     // 移動量が普段から外れ始めたところより後を濃い赤、手前を橙で描く。
     // どこから色が変わるかが、そのまま「ドリフトが始まったあたり」になる。
     if (tool === 'pick' && pickPoints.length > 0) {
-      const warnFrom = (() => {
-        if (pickMedianStep <= 0) return pickPoints.length;
-        for (let i = 0; i < pickPoints.length; i++) {
-          if (pickPoints[i].step > Math.max(pickMedianStep * 2, pickMedianStep + 4)) {
-            return i;
-          }
-        }
-        return pickPoints.length;
-      })();
       ctx.save();
       pickPoints.forEach((q, i) => {
-        const warn = i >= warnFrom;
+        const warn = i >= pickWarnFrom;
         ctx.beginPath();
-        ctx.arc(q.point.x, q.point.y, 7 * k, 0, Math.PI * 2);
+        ctx.arc(q.point.x, q.point.y, 6 * k, 0, Math.PI * 2);
         ctx.fillStyle = warn ? 'rgba(239,68,68,0.9)' : 'rgba(245,158,11,0.85)';
         ctx.fill();
         ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-        ctx.lineWidth = 1.6 * k;
+        ctx.lineWidth = 1.5 * k;
         ctx.stroke();
       });
+      // 選択中は二重の輪で囲む。どれを選んでいるかが分からないまま
+      // 「決定」を押させてはいけない。
+      if (pickIdx !== null && pickPoints[pickIdx]) {
+        const c = pickPoints[pickIdx].point;
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 13 * k, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+        ctx.lineWidth = 4 * k;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 13 * k, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2.2 * k;
+        ctx.stroke();
+      }
       ctx.restore();
     }
 
@@ -1623,7 +1699,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     historyData, objects, selectedObjId, showTrail, gesture, dragStart, dragCurrent,
     calibration, tool, isPlaying, roiSize, linePending, calibHandle,
     canvasPerScreen, view.z, nearestFrameIndex, grabPoint, frameTolerance, issueTimes,
-    roiCenter, pickPoints, pickMedianStep,
+    roiCenter, pickPoints, pickWarnFrom, pickIdx,
   ]);
 
   renderRef.current = renderFrame;
@@ -1891,10 +1967,9 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const restartTime = restartTimeFor(timeRange, roiTimes);
 
   /**
-   * 記録が始まるコマへ送るだけ。軌跡は消さない。
-   * やり直し（↺）と混同されていたので、別のボタンに分けた。
+   * 指定した時刻のコマへ送る。
+   * 止めた点を手で直すとき、候補を選んで中身を確かめるときに使う。
    */
-  /** 指定した時刻のコマへ送る（止めた点を手で直すときに使う） */
   const seekToTime = useCallback(async (t: number) => {
     const v = videoRef.current;
     if (!v) return;
@@ -1907,6 +1982,32 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     } catch (_) { /* シークに失敗しても状態は壊さない */ }
     renderRef.current();
   }, [setIsPlaying]);
+
+  // 「ここまでは正しい」に入ったら、まずアプリ側の答えを置く
+  useEffect(() => {
+    if (tool !== 'pick') { setPickIdx(null); return; }
+    setPickIdx(prev => (prev === null ? pickSuggest : prev));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool, pickSuggest]);
+
+  /**
+   * 選んだ候補のコマへ送る。
+   *
+   * これが要る理由。候補を選ぶ判断は「点がマーカーの上に乗っているか」で、
+   * それは**そのコマの映像を見ないと決められない**。止まったコマのまま
+   * 点だけを並べても、どれが正解なのかは分からなかった。
+   *
+   * 指でなぞっている間は送らない。1 候補ごとにシークすると追いつかない。
+   * 指を離してから送る。
+   */
+  useEffect(() => {
+    if (tool !== 'pick' || pickIdx === null) return;
+    if (gesture?.kind === 'pick') return;
+    const q = pickPoints[pickIdx];
+    if (!q) return;
+    void seekToTime(q.time);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool, pickIdx, gesture?.kind]);
 
   const goToStart = useCallback(async () => {
     const v = videoRef.current;
@@ -2045,7 +2146,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (cutMsg) {
       return { text: `✂ ${cutMsg}`, bg: 'rgba(16,185,129,0.95)', color: '#04221a' };
     }
-    if (tool === 'pick') return null;   // 案内はパネルの方に出している
+    if (tool === 'pick') return null;   // 帯の中に基準を書いている
     if (tool === 'calib') {
       if (calibration.mode === 'plane') {
         const n = calibration.planePoints.length % 4;
@@ -2372,9 +2473,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               {halt.objId}: {halt.time.toFixed(3)} s で追跡が飛びました
             </div>
             <div className="hint" style={{ margin: 0 }}>
-              1 コマ {Math.round(halt.step)}px・直前までは {Math.round(halt.base)}px
-              {halt.atEdge && '・探索窓の縁'}。このコマに ✕ を付けて軌跡を切りました。
-              ずれは数コマ前から始まっていることが多いので、戻す位置を選んでください。
+              1 コマ {Math.round(halt.step)}px（普段は {Math.round(halt.base)}px）
+              {halt.atEdge && '・探索窓の縁'}。✕ の手前からずれ始めています。
             </div>
             <button
               className="btn btn-primary btn-sm"
@@ -2408,25 +2508,66 @@ export const VideoStage: React.FC<VideoStageProps> = ({
         )}
 
         {/* ---- どこまで戻すかを選ぶ ---- */}
+        {/*
+            一列の細い帯にしてある。前は縦に積んだパネルで、映像の下半分を
+            覆っていた。選ぶ対象は映像の上の点なので、覆ってはいけない。
+        */}
         {tool === 'pick' && (
           <div
-            className="stage__haltbar fade-in"
+            className="stage__pickbar"
             onPointerDown={e => e.stopPropagation()}
             onPointerUp={e => e.stopPropagation()}
           >
-            <div className="stage__haltbar-title" style={{ color: 'var(--color-warning)' }}>
-              正しい最後の点をタップ
-            </div>
-            <div className="hint" style={{ margin: 0 }}>
-              赤い点は、そこまでの移動量が普段から外れているコマです。
-              タップした点より後の記録を捨てて、枠をその位置へ戻します。
+            <div className="stage__pickbar-why">
+              点がマーカーに乗っている<b>最後のコマ</b>へ。◀▶ か軌跡をなぞって選ぶと、
+              そのコマが映ります
             </div>
             <button
-              className="btn btn-secondary btn-sm"
-              style={{ width: '100%' }}
+              className="btn btn-icon btn-sm btn-secondary"
+              aria-label="1つ前の点"
+              disabled={pickIdx === null || pickIdx <= 0}
+              onClick={() => setPickIdx(i => (i === null ? null : Math.max(0, i - 1)))}
+            >
+              <ChevronLeft size={16} />
+            </button>
+            <div className="stage__pickbar-info">
+              <b className="mono">
+                {pickIdx !== null && pickPoints[pickIdx]
+                  ? `${pickPoints[pickIdx].time.toFixed(3)} s`
+                  : '—'}
+              </b>
+              <span>
+                {pickIdx !== null && pickPoints.length - 1 - pickIdx > 0
+                  ? `後ろ ${pickPoints.length - 1 - pickIdx} 点を捨てる`
+                  : 'この点まで残す'}
+              </span>
+            </div>
+            <button
+              className="btn btn-icon btn-sm btn-secondary"
+              aria-label="1つ後の点"
+              disabled={pickIdx === null || pickIdx >= pickPoints.length - 1}
+              onClick={() =>
+                setPickIdx(i => (i === null ? null : Math.min(pickPoints.length - 1, i + 1)))
+              }
+            >
+              <ChevronRight size={16} />
+            </button>
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={pickIdx === null || !pickPoints[pickIdx]}
+              onClick={() => {
+                if (pickIdx !== null && pickPoints[pickIdx]) cutAt(pickPoints[pickIdx]);
+              }}
+            >
+              <Scissors size={15} />
+              ここで切る
+            </button>
+            <button
+              className="btn btn-icon btn-sm btn-secondary"
+              aria-label="やめる"
               onClick={() => { onDismissHalt(false); setTool('pan'); }}
             >
-              やめる
+              <XCircle size={16} />
             </button>
           </div>
         )}

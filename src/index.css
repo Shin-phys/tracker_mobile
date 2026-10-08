@@ -239,6 +239,59 @@ body {
   z-index: 7;
 }
 
+/* 「ここまでは正しい」を選ぶ帯。
+   選ぶ対象は映像の上の点なので、映像を覆ってはいけない。
+   操作は一列に収め、基準の一文だけを上に細く乗せている。 */
+.stage__pickbar {
+  position: absolute;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
+  width: calc(100% - 16px);
+  display: grid;
+  grid-template-columns: auto 1fr auto auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: 12px;
+  background: rgba(8, 13, 26, 0.92);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.6);
+  z-index: 7;
+}
+
+/* 基準の一文。帯の全幅に乗せる */
+.stage__pickbar-why {
+  grid-column: 1 / -1;
+  font-size: 0.68rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  padding: 0 2px 1px;
+}
+
+.stage__pickbar-why b {
+  color: var(--color-warning);
+}
+
+.stage__pickbar-info {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.stage__pickbar-info b {
+  font-size: 0.82rem;
+  color: var(--text-primary);
+}
+
+.stage__pickbar-info span {
+  font-size: 0.64rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 /* 追跡が飛んで止まったときの案内。
    選択肢をボタンで並べるので、ヒント帯ではなくパネルにしている。
    下寄せなのは、映像の上側に軌跡と候補点が出るため。 */
