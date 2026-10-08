@@ -242,6 +242,8 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [cutMsg, setCutMsg] = useState<string | null>(null);
   /** 橋渡しで指した点の数 */
   const [bridgeCount, setBridgeCount] = useState(0);
+  /** 再生速度の選択肢を開いているか */
+  const [rateOpen, setRateOpen] = useState(false);
   /**
    * 「ここまでは正しい」で選んでいる候補の番号。
    *
@@ -2827,19 +2829,42 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             <SkipBack size={16} />
           </button>
 
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+          {/*
+              再生速度は「ひとつ選んだら、その動画のあいだは変えない」設定なので、
+              5 つ並べたままにしておく価値が薄い。常時並べると行に収まらず
+              折り返して、映像の高さをずっと奪っていた。
+              普段は今の速度だけを出し、押したときだけ選択肢を開く。
+          */}
+          <button
+            className={`chip ${rateOpen ? 'is-active' : ''}`}
+            style={{ marginLeft: 'auto', minHeight: 34, padding: '4px 10px', fontSize: '0.74rem' }}
+            onClick={() => setRateOpen(v => !v)}
+            aria-label={`再生速度 ${rateLabel(playbackRate)}（押すと変えられます）`}
+          >
+            {rateLabel(playbackRate)}
+            {rateOpen ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
+          </button>
+        </div>
+
+        {rateOpen && (
+          <div className="playbar__row fade-in" style={{ gap: 6 }}>
+            <span style={{
+              fontSize: '0.72rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap',
+            }}>
+              再生速度
+            </span>
             {PLAYBACK_RATES.map(r => (
               <button
                 key={r.v}
                 className={`chip ${Math.abs(playbackRate - r.v) < 1e-6 ? 'is-active' : ''}`}
-                style={{ minHeight: 34, padding: '4px 9px', fontSize: '0.72rem' }}
-                onClick={() => setPlaybackRate(r.v)}
+                style={{ flex: 1, minHeight: 34, padding: '4px 6px', fontSize: '0.72rem' }}
+                onClick={() => { setPlaybackRate(r.v); setRateOpen(false); }}
               >
                 {r.label}
               </button>
             ))}
           </div>
-        </div>
+        )}
 
         {/* 打つ物体を選ぶ列。順番どおりでない打ち方をしたいときの逃げ道 */}
         {tool === 'manual' && manualOrder.length > 1 && (
