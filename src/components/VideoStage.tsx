@@ -525,10 +525,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   // 枠ツールに入ってから確定するまで、シートを畳んでもらう
   useEffect(() => {
-    // 枠・橋渡し・戻す位置の選択は、映像を広く見せないと決められない
-    onAimingChange(tool === 'roi' || tool === 'bridge' || tool === 'pick');
+    // 枠・橋渡し・戻す位置の選択は、映像を広く見せないと決められない。
+    // トリム中の再生も同じ。終点は映像を見て決めるものなので、
+    // シートが半分を占めたままでは判断できない（止めれば戻る）。
+    onAimingChange(
+      tool === 'roi' || tool === 'bridge' || tool === 'pick'
+      || (trimMode && isPlaying)
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool]);
+  }, [tool, trimMode, isPlaying]);
 
   /**
    * 2 点目の結果は少し経ったら消す。
@@ -2219,7 +2224,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       return {
         text: roiCenter
           ? '大きさを合わせて「決定」'
-          : `${selectedObjId} — 対象の中心を押す（指を動かすと拡大鏡で合わせられます）`,
+          : `${selectedObjId} の中心を押す`,
         bg: `${selected?.color || '#6366f1'}f0`, color: '#fff',
       };
     }

@@ -152,7 +152,14 @@ export const App: React.FC = () => {
   const [notice, setNotice] = useState<string | null>(null);
 
   // ---- モバイル UI の状態 ----
-  const [tool, setTool] = useState<StageTool>('roi');
+  /**
+   * 映像の操作ツール。既定は移動。
+   *
+   * 以前は 'roi' を既定にしていたので、トリムしている最中に「枠を置く」の
+   * 案内が映像の上に出続け、しかも映像をタップすると枠が置かれていた。
+   * ツールはタブに従わせる（下の useEffect）。
+   */
+  const [tool, setTool] = useState<StageTool>('pan');
   const [roiSize, setRoiSize] = useState(40);
   const [calibHandle, setCalibHandle] = useState(0);
   /**
@@ -318,6 +325,29 @@ export const App: React.FC = () => {
     // 別の動画なら手順はやり直しなので、とばした記録も戻す
     setGuideSkipped([]);
   }, [videoLoaded]);
+
+  /**
+   * そのタブで意味のあるツールか。
+   *
+   * タブを移ったら、前のタブのツールは外す。外さないと、トリムを見ている
+   * 最中に映像をタップして枠が置かれる、といったことが起きる。
+   * ただしタブとツールを同時に指定する操作（ガイドの行き先など）を
+   * 打ち消さないよう、「そのタブに属するツールなら残す」形にしてある。
+   */
+  const toolFitsTab = (t: TabId, k: StageTool): boolean => {
+    if (k === 'pan') return true;
+    if (t === 'objects') {
+      return k === 'roi' || k === 'seed' || k === 'correct'
+        || k === 'manual' || k === 'bridge' || k === 'pick';
+    }
+    if (t === 'calib') return k === 'calib' || k === 'origin';
+    return false;
+  };
+
+  useEffect(() => {
+    if (!toolFitsTab(tab, tool)) setTool('pan');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   const openTab = (id: TabId) => {
     const pts = snapPoints();

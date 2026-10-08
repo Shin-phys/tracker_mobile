@@ -218,6 +218,12 @@ body {
   text-align: center;
   pointer-events: none;
   z-index: 6;
+  /* 映像の上に乗るものなので、2 行までに抑える。
+     以前は行数の上限が無く、長い案内が縦に伸びて映像を覆っていた。 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.55);
 }
 
