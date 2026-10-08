@@ -37,8 +37,15 @@ interface Props {
 
 export const GuideBar: React.FC<Props> = ({ steps, skipped, onSkip, onClose }) => {
   const total = steps.length;
-  const doneCount = steps.filter(s => s.done || skipped.includes(s.id)).length;
   const current = steps.find(s => !s.done && !skipped.includes(s.id));
+  /**
+   * 出す番号は「今どの手順か」。
+   *
+   * 済んだ数＋1 にしていたら、あと回しにした手順があるときに番号が
+   * 先走った（5 番目を出しながら 7/9 と書く、という状態になっていた）。
+   * 出している文と番号は同じものを指していないといけない。
+   */
+  const index = current ? steps.indexOf(current) + 1 : total;
 
   if (!current) {
     return (
@@ -54,7 +61,7 @@ export const GuideBar: React.FC<Props> = ({ steps, skipped, onSkip, onClose }) =
 
   return (
     <div className="guidebar">
-      <span className="guidebar__step">{doneCount + 1}/{total}</span>
+      <span className="guidebar__step">{index}/{total}</span>
       <button
         className="guidebar__what guidebar__go"
         onClick={current.go}

@@ -1428,7 +1428,7 @@ export const App: React.FC = () => {
       },
       {
         id: 'calib',
-        what: '長さの分かるものを指して、スケールを決める',
+        what: '長さの分かるものを指して、スケールを決める（結果は m で出ます）',
         done: calibrated,
         go: go('calib'),
       },
