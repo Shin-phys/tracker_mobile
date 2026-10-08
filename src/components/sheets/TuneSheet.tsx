@@ -100,12 +100,12 @@ export const TuneSheet: React.FC<Props> = ({
             />
 
             <Slider
-              label="探索範囲"
+              label="探索範囲（上限）"
               value={tracking.searchScale}
               display={`${tracking.searchScale.toFixed(1)}×`}
-              min={0.6} max={4} step={0.2}
+              min={0.4} max={4} step={0.2}
               onChange={v => onUpdateTracking({ ...tracking, searchScale: v })}
-              hint="速く動く対象では大きめに。大きいほど処理は重くなります（既定 1.2×。見失うときだけ上げてください）"
+              hint="普段の窓は動きの変化から自動で決まります。ここはその上限（既定 1.0×）。目印を使っているなら小さいほうが有利です。広い窓は似た模様に乗り移る機会を増やすだけで、追跡の役には立ちません"
             />
 
             <Switch
