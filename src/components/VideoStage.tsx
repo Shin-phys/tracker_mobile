@@ -1407,6 +1407,23 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       ctx.lineWidth = (isSel ? 2.5 : 1.5) * k;
       ctx.setLineDash(isLost ? [6 * k, 4 * k] : []);
       ctx.strokeRect(x, y, width, height);
+
+      // 実際に探している範囲。選択中の対象だけ、薄い点線で出す。
+      //
+      // 探索範囲は「数字をいくつにすべきか」が分からない類の設定だった。
+      // 探している範囲が枠と一緒に見えていれば、広すぎる／狭すぎるを
+      // 目で判断できる。等速で追えている間はごく小さいのが正しい姿。
+      if (isSel && !calibActive && obj.searchPx && obj.status === 'tracking') {
+        const m = obj.searchPx;
+        ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+        ctx.lineWidth = 1 * k;
+        ctx.setLineDash([3 * k, 3 * k]);
+        ctx.strokeRect(x - m, y - m, width + m * 2, height + m * 2);
+        ctx.setLineDash([]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = (isSel ? 2.5 : 1.5) * k;
+        ctx.setLineDash(isLost ? [6 * k, 4 * k] : []);
+      }
       ctx.setLineDash([]);
 
       // 名前を出すのは選択中と LOST のときだけ。

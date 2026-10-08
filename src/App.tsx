@@ -1146,7 +1146,10 @@ export const App: React.FC = () => {
         const frameObjects: FrameData['objects'] = {};
         /** このコマで「飛んだ」物体。判定は全部出そろってから */
         const suspects: { id: string; step: number; base: number; atEdge: boolean }[] = [];
-        const updates: { id: string; status: ObjectStatus; roi?: Rect; center?: Point }[] = [];
+        const updates: {
+          id: string; status: ObjectStatus; roi?: Rect; center?: Point;
+          searchPx?: number;
+        }[] = [];
 
         activeObjs.forEach(obj => {
           if (!obj.roi) return;
@@ -1234,6 +1237,7 @@ export const App: React.FC = () => {
               status: res.state === 'lost' ? 'lost' : 'tracking',
               roi: res.roi,
               center: res.center,
+              searchPx: res.searchPx,
             });
           } catch (objErr) {
             console.error(`[App] Tracker error on ${obj.id}:`, objErr);
@@ -1293,6 +1297,7 @@ export const App: React.FC = () => {
                 status: u.status,
                 ...(u.roi ? { roi: u.roi } : {}),
                 ...(u.center ? { center: u.center } : {}),
+                ...(u.searchPx !== undefined ? { searchPx: u.searchPx } : {}),
               } as TrackedObject;
             });
             return changed ? next : prev;
