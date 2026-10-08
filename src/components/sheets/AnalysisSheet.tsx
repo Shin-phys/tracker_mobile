@@ -14,13 +14,14 @@
 //   ・残差を見られるようにする（構造が残っていたらモデルが違う）
 // ============================================================
 
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   TrackedObject, FrameData, FpsSettings, ScaleCalibration,
 } from '../../types';
 import {
   fitSeries, rawSeries, pickQuantity, accelerationOf, velocityOf,
-  secondDiffStats, FitModel, FitQuantity, FitResult, G_STANDARD,
+  secondDiffStats, secondDiffSeries, meanSd, insideBox, recommendK, medianStep,
+  FitModel, FitQuantity, FitResult, FitBox, G_STANDARD,
 } from '../../utils/fit';
 import { ticksFor, fmtTick } from '../../utils/plotScale';
 import { timeScale } from '../../utils/timeScale';
@@ -70,16 +71,26 @@ const fmt = (v: number, d = 4): string => {
 // 残差だけ見せても「何に何を当てはめたのか」が分からない。
 
 const FitPlot: React.FC<{
-  pts: { t: number; y: number }[];
+  /** 全部の点。軸の範囲はこちらで決める（選択を変えても軸が動かないように） */
+  all: { t: number; y: number }[];
+  /** 当てはめに使っている点 */
+  used: { t: number; y: number }[];
   fit: FitResult;
   yLabel: string;
-}> = ({ pts, fit, yLabel }) => {
+  box: FitBox | null;
+  /** 範囲を選ぶモードか */
+  selecting: boolean;
+  onBox: (b: FitBox | null) => void;
+}> = ({ all, used, fit, yLabel, box, selecting, onBox }) => {
   const W = 330;
   const H = 210;
   const pad = { l: 46, r: 10, t: 10, b: 26 };
-  const tMin = Math.min(...pts.map(p => p.t));
-  const tMax = Math.max(...pts.map(p => p.t));
-  const ysAll = [...pts.map(p => p.y), fit.evalAt(tMin), fit.evalAt(tMax)];
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [drag, setDrag] = useState<{ a: FitBox; b: FitBox } | null>(null);
+
+  const tMin = Math.min(...all.map(p => p.t));
+  const tMax = Math.max(...all.map(p => p.t));
+  const ysAll = [...all.map(p => p.y), fit.evalAt(tMin), fit.evalAt(tMax)];
   let yMin = Math.min(...ysAll);
   let yMax = Math.max(...ysAll);
   const span = yMax - yMin || 1;
@@ -90,20 +101,78 @@ const FitPlot: React.FC<{
     pad.l + ((t - tMin) / Math.max(1e-12, tMax - tMin)) * (W - pad.l - pad.r);
   const py = (y: number) =>
     H - pad.b - ((y - yMin) / Math.max(1e-12, yMax - yMin)) * (H - pad.t - pad.b);
+  const tAt = (vx: number) =>
+    tMin + ((vx - pad.l) / Math.max(1, W - pad.l - pad.r)) * (tMax - tMin);
+  const yAt = (vy: number) =>
+    yMin + ((H - pad.b - vy) / Math.max(1, H - pad.t - pad.b)) * (yMax - yMin);
+
+  /** 画面の座標 → データの座標 */
+  const toData = (clientX: number, clientY: number) => {
+    const el = svgRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const vx = ((clientX - r.left) / Math.max(1, r.width)) * W;
+    const vy = ((clientY - r.top) / Math.max(1, r.height)) * H;
+    return { t: tAt(vx), y: yAt(vy) };
+  };
+
+  const usedSet = useMemo(
+    () => new Set(used.map(p => p.t)), [used]
+  );
 
   const xTicks = ticksFor(tMin, tMax, 4);
   const yTicks = ticksFor(yMin, yMax, 4);
   const xStep = xTicks.length > 1 ? xTicks[1] - xTicks[0] : 1;
   const yStep = yTicks.length > 1 ? yTicks[1] - yTicks[0] : 1;
 
-  // 当てはめた線。放物線もあるので細かく刻んで折れ線にする
+  // 当てはめた線は、使った点の範囲だけに引く。
+  // 外まで伸ばすと、選んでいない区間まで当てはめたように見える。
+  const uT0 = used.length > 0 ? Math.min(...used.map(p => p.t)) : tMin;
+  const uT1 = used.length > 0 ? Math.max(...used.map(p => p.t)) : tMax;
   const curve: string = Array.from({ length: 61 }, (_, i) => {
-    const t = tMin + ((tMax - tMin) * i) / 60;
+    const t = uT0 + ((uT1 - uT0) * i) / 60;
     return `${i === 0 ? 'M' : 'L'}${px(t).toFixed(1)},${py(fit.evalAt(t)).toFixed(1)}`;
   }).join(' ');
 
+  const live = drag
+    ? {
+        t0: Math.min(drag.a.t0, drag.b.t0), t1: Math.max(drag.a.t0, drag.b.t0),
+        y0: Math.min(drag.a.y0, drag.b.y0), y1: Math.max(drag.a.y0, drag.b.y0),
+      }
+    : box;
+
   return (
-    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+    <svg
+      ref={svgRef}
+      width="100%"
+      viewBox={`0 0 ${W} ${H}`}
+      style={{ display: 'block', touchAction: selecting ? 'none' : 'auto' }}
+      onPointerDown={e => {
+        if (!selecting) return;
+        const d = toData(e.clientX, e.clientY);
+        if (!d) return;
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+        const one: FitBox = { t0: d.t, t1: d.t, y0: d.y, y1: d.y };
+        setDrag({ a: one, b: one });
+      }}
+      onPointerMove={e => {
+        if (!drag) return;
+        const d = toData(e.clientX, e.clientY);
+        if (!d) return;
+        setDrag(p0 => (p0 ? { a: p0.a, b: { t0: d.t, t1: d.t, y0: d.y, y1: d.y } } : null));
+      }}
+      onPointerUp={() => {
+        if (!drag) return;
+        const b: FitBox = {
+          t0: Math.min(drag.a.t0, drag.b.t0), t1: Math.max(drag.a.t0, drag.b.t0),
+          y0: Math.min(drag.a.y0, drag.b.y0), y1: Math.max(drag.a.y0, drag.b.y0),
+        };
+        setDrag(null);
+        // 指が滑っただけのような極小の矩形は、選択ではなく解除とみなす
+        const tiny = (b.t1 - b.t0) < (tMax - tMin) * 0.03;
+        onBox(tiny ? null : b);
+      }}
+    >
       {yTicks.map(v => (
         <g key={`y${v}`}>
           <line x1={pad.l} y1={py(v)} x2={W - pad.r} y2={py(v)}
@@ -120,12 +189,87 @@ const FitPlot: React.FC<{
             textAnchor="middle">{fmtTick(v, xStep)}</text>
         </g>
       ))}
-      {pts.map((p, i) => (
-        <circle key={i} cx={px(p.t)} cy={py(p.y)} r={2.6} fill={DOT} opacity={0.9} />
-      ))}
+
+      {live && (
+        <rect
+          x={Math.min(px(live.t0), px(live.t1))}
+          y={Math.min(py(live.y0), py(live.y1))}
+          width={Math.abs(px(live.t1) - px(live.t0))}
+          height={Math.abs(py(live.y1) - py(live.y0))}
+          fill="rgba(99,102,241,0.14)"
+          stroke="rgba(129,140,248,0.9)" strokeWidth={1.2}
+        />
+      )}
+
+      {all.map((p, i) => {
+        const on = usedSet.has(p.t);
+        return (
+          <circle key={i} cx={px(p.t)} cy={py(p.y)} r={on ? 2.6 : 2}
+            fill={on ? DOT : 'rgba(148,163,184,0.45)'} />
+        );
+      })}
       <path d={curve} fill="none" stroke={LINE} strokeWidth={1.8} opacity={0.95} />
       <text x={pad.l} y={H - 2} fill="var(--text-muted)" fontSize={9}>t (s)</text>
       <text x={2} y={pad.t + 2} fill="var(--text-muted)" fontSize={9}>{yLabel}</text>
+    </svg>
+  );
+};
+
+/**
+ * a-t 図。2 階差分で出した加速度の時間変化。
+ *
+ * Δt を選ばずに出した a-t 図は意味がない。合成データでは、240fps の
+ * 隣り合うコマ（k=1）で出すと標準偏差が 80 m/s² になり、真値 9.8 が
+ * ノイズに埋もれる。同じデータでも k=8 なら 1.1 に収まる。
+ * だから Δt の選択と、ばらつきの帯を必ず一緒に出す。
+ */
+const AtPlot: React.FC<{
+  data: { t: number; a: number }[];
+  mean: number;
+  sd: number;
+  unit: string;
+}> = ({ data, mean, sd, unit }) => {
+  const W = 330;
+  const H = 170;
+  const pad = { l: 46, r: 10, t: 10, b: 24 };
+  if (data.length < 2) return null;
+  const tMin = Math.min(...data.map(p => p.t));
+  const tMax = Math.max(...data.map(p => p.t));
+  // 縦軸は平均 ± 3SD。外れ値に引っぱられて潰れるのを防ぐ
+  const half = Math.max(sd * 3, Math.abs(mean) * 0.15, 1e-9);
+  const yMin = mean - half;
+  const yMax = mean + half;
+  const px = (t: number) =>
+    pad.l + ((t - tMin) / Math.max(1e-12, tMax - tMin)) * (W - pad.l - pad.r);
+  const py = (a: number) =>
+    H - pad.b - ((a - yMin) / (yMax - yMin)) * (H - pad.t - pad.b);
+  const yTicks = ticksFor(yMin, yMax, 4);
+  const yStep = yTicks.length > 1 ? yTicks[1] - yTicks[0] : 1;
+  const clamp = (v: number) => Math.min(H - pad.b, Math.max(pad.t, py(v)));
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+      <rect x={pad.l} y={clamp(mean + sd)} width={W - pad.l - pad.r}
+        height={Math.max(1, clamp(mean - sd) - clamp(mean + sd))}
+        fill="rgba(96,165,250,0.16)" />
+      {yTicks.map(v => (
+        <g key={v}>
+          <line x1={pad.l} y1={py(v)} x2={W - pad.r} y2={py(v)}
+            stroke="rgba(255,255,255,0.07)" strokeWidth={1} />
+          <text x={pad.l - 5} y={py(v) + 3} fill="var(--text-muted)" fontSize={9}
+            textAnchor="end">{fmtTick(v, yStep)}</text>
+        </g>
+      ))}
+      <line x1={pad.l} y1={py(mean)} x2={W - pad.r} y2={py(mean)}
+        stroke={LINE} strokeWidth={1.6} opacity={0.9} />
+      {data.map((p, i) => (
+        <circle key={i} cx={px(p.t)} cy={clamp(p.a)} r={2.4} fill={DOT}
+          opacity={p.a > yMax || p.a < yMin ? 0.35 : 0.9} />
+      ))}
+      <text x={2} y={pad.t + 2} fill="var(--text-muted)" fontSize={9}>a ({unit})</text>
+      <text x={pad.l} y={H - 2} fill="var(--text-muted)" fontSize={9}>t (s)</text>
+      <text x={W - pad.r} y={H - 2} fill="var(--text-muted)" fontSize={9}
+        textAnchor="end">白線 = 平均 / 帯 = ±SD</text>
     </svg>
   );
 };
@@ -198,6 +342,13 @@ export const AnalysisSheet: React.FC<Props> = ({
    * 戻せるようにしてある。
    */
   const [dropIssues, setDropIssues] = useState(true);
+  /** 矩形で選んだ範囲。null なら全部 */
+  const [box, setBox] = useState<FitBox | null>(null);
+  /** 範囲を選ぶモードか（スマホではシートのスクロールと食い合うので切り替える） */
+  const [selecting, setSelecting] = useState(false);
+  /** a-t の Δt（何コマ分か）。null なら自動 */
+  const [atK, setAtK] = useState<number | null>(null);
+  const [showAt, setShowAt] = useState(false);
 
   /**
    * 表示に使う単位。
@@ -230,15 +381,50 @@ export const AnalysisSheet: React.FC<Props> = ({
     [historyData, target?.id, selectedObjId, scale, timeRange, excludeTimes]
   );
   const values = pickQuantity(series, quantity);
-  const pts = useMemo(
+  /** 区間内の全部の点（軸の範囲と「選ばなかった点」の表示に使う） */
+  const allPts = useMemo(
     () => series.t.map((t, i) => ({ t, y: values[i] })),
     [series.t, values]
   );
+  /** 矩形で絞ったあとの、当てはめに使う点 */
+  const pts = useMemo(() => insideBox(allPts, box), [allPts, box]);
   const fit = useMemo(() => fitSeries(pts, model), [pts, model]);
-  const sdStats = useMemo(() => {
-    if (quantity === 'vx' || quantity === 'vy') return [];
-    return secondDiffStats(series.t, values);
-  }, [series.t, values, quantity]);
+
+  // 量やモデルを変えたら、縦軸の意味が変わるので選択は外す。
+  // 残したままだと、別の量の値域で切った矩形がそのまま効いてしまう。
+  const lastQ = useRef<string>('');
+  const qKey = `${target?.id ?? ''}|${quantity}`;
+  if (lastQ.current !== qKey) {
+    lastQ.current = qKey;
+    if (box) setBox(null);
+  }
+
+  // ---- a-t ----
+  // 位置の 2 階差分で出す。速度を選んでいるときは、その軸の位置を使う。
+  const atSource = quantity === 'vx' || quantity === 'x' ? series.x : series.y;
+  const atRange = useMemo(() => {
+    if (!box) return { t: series.t, y: atSource };
+    const t: number[] = [];
+    const y: number[] = [];
+    for (let i = 0; i < series.t.length; i++) {
+      if (series.t[i] >= box.t0 && series.t[i] <= box.t1) {
+        t.push(series.t[i]);
+        y.push(atSource[i]);
+      }
+    }
+    return { t, y };
+  }, [series.t, atSource, box]);
+  const atDt = useMemo(() => medianStep(atRange.t), [atRange.t]);
+  const atKUsed = atK ?? recommendK(atDt);
+  const atData = useMemo(
+    () => secondDiffSeries(atRange.t, atRange.y, atKUsed),
+    [atRange, atKUsed]
+  );
+  const atStat = useMemo(() => meanSd(atData.map(d => d.a)), [atData]);
+  const sdStats = useMemo(
+    () => secondDiffStats(atRange.t, atRange.y),
+    [atRange]
+  );
 
   const accel = fit ? accelerationOf(quantity, fit) : null;
   const vel = fit ? velocityOf(quantity, fit) : null;
@@ -334,12 +520,41 @@ export const AnalysisSheet: React.FC<Props> = ({
       {fit && (
         <>
           {/* ---- 絵で見せる ---- */}
-          <Card title={`${quantity}-t と当てはめた線`}>
-            <FitPlot pts={pts} fit={fit} yLabel={`${quantity} (${qUnit})`} />
-            <div className="hint" style={{ marginTop: 4 }}>
-              青い点が実測、白い線が当てはめた{model === 'linear' ? '直線' : '放物線'}です。
-              点が線から系統的に離れていたら、モデルか追跡のどちらかが合っていません。
-            </div>
+          <Card
+            title={`${quantity}-t と当てはめた線`}
+            right={
+              <button
+                className={`btn btn-sm ${selecting ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => setSelecting(v => !v)}
+              >
+                {selecting ? '選択を終える' : '範囲を選ぶ'}
+              </button>
+            }
+          >
+            <FitPlot
+              all={allPts} used={pts} fit={fit}
+              yLabel={`${quantity} (${qUnit})`}
+              box={box} selecting={selecting} onBox={setBox}
+            />
+            {box ? (
+              <div className="row-between" style={{ marginTop: 6, gap: 8 }}>
+                <span style={{ fontSize: '0.76rem', color: 'var(--accent-primary)' }}>
+                  選んだ範囲の <b>{pts.length}</b> 点で当てはめています
+                  （全 {allPts.length} 点）
+                </span>
+                <button className="btn btn-secondary btn-sm" style={{ flexShrink: 0 }}
+                  onClick={() => setBox(null)}>
+                  全部に戻す
+                </button>
+              </div>
+            ) : (
+              <div className="hint" style={{ marginTop: 4 }}>
+                青い点が実測、白い線が当てはめた{model === 'linear' ? '直線' : '放物線'}です。
+                {selecting
+                  ? ' グラフの上をなぞると、その矩形の中の点だけで当てはめ直します。'
+                  : ' 一部だけで当てはめたいときは「範囲を選ぶ」。'}
+              </div>
+            )}
           </Card>
 
           {/* ---- 答え ---- */}
@@ -413,6 +628,61 @@ export const AnalysisSheet: React.FC<Props> = ({
                   橙の点は RMSE の 2.5 倍を超えた点で、タップするとその時刻へ飛びます。
                 </div>
               </div>
+            )}
+          </Card>
+
+          {/* ---- a-t 図 ---- */}
+          <Card
+            title="a-t 図（2 階差分）"
+            right={
+              <button className="btn btn-secondary btn-sm"
+                onClick={() => setShowAt(v => !v)}>
+                {showAt ? '閉じる' : '開く'}
+              </button>
+            }
+          >
+            {!showAt ? (
+              <div className="hint" style={{ margin: 0 }}>
+                加速度の時間変化を、位置の 2 階差分で出します。Δt を選んでください。
+              </div>
+            ) : atData.length < 2 ? (
+              <div className="hint" style={{ margin: 0 }}>
+                この Δt では点が足りません。Δt を小さくするか、範囲を広げてください。
+              </div>
+            ) : (
+              <>
+                <div className="chips" style={{ marginBottom: 8 }}>
+                  {[1, 2, 4, 8, 16].map(k => (
+                    <button key={k}
+                      className={`chip ${k === atKUsed ? 'is-active' : ''}`}
+                      style={{ minHeight: 32, padding: '4px 9px', fontSize: '0.72rem' }}
+                      onClick={() => setAtK(k)}
+                    >
+                      {(atDt * k * 1000).toFixed(0)}ms
+                      {k === recommendK(atDt) && atK === null ? '（自動）' : ''}
+                    </button>
+                  ))}
+                </div>
+                <AtPlot data={atData} mean={atStat.mean} sd={atStat.sd} unit={aUnit} />
+                <div className="row-between" style={{ marginTop: 6, fontSize: '0.82rem' }}>
+                  <span>平均</span>
+                  <b className="mono">
+                    {fmt(atStat.mean, 3)} ± {fmt(atStat.sd, 3)} {aUnit}
+                  </b>
+                </div>
+                {accel && (
+                  <div className="hint" style={{ marginTop: 6 }}>
+                    当てはめから出した加速度は <b className="mono">{fmt(accel.value, 3)}</b>。
+                    この 2 つが近ければ、どちらの出し方でも同じ答えが出ているということです。
+                  </div>
+                )}
+                <div className="hint" style={{ marginTop: 6 }}>
+                  Δt を小さくするとばらつきが跳ね上がります（分母が (Δt)² なので、
+                  半分にすると 4 倍）。大きくすると「その区間で加速度が一定」という
+                  前提が効いてきて、変化のある運動では鈍ります。
+                  <b>実時間で 30ms 前後</b>が目安です。
+                </div>
+              </>
             )}
           </Card>
 
