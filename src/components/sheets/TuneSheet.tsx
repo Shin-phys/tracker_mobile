@@ -9,8 +9,9 @@
 
 import React, { useState } from 'react';
 import {
-  TrackingSettings, MarkerMode, DEFAULT_TRACKING,
+  TrackingSettings, MarkerMode, DEFAULT_TRACKING, ColorKey,
 } from '../../types';
+import { describeKey } from '../../utils/colorKey';
 import { Card, Slider, Switch } from '../ui';
 import { Settings2, RotateCcw, Eraser, ChevronDown, ChevronUp } from 'lucide-react';
 
@@ -20,6 +21,11 @@ interface Props {
   onChangeGuideOn: (v: boolean) => void;
   tracking: TrackingSettings;
   onUpdateTracking: (t: TrackingSettings) => void;
+  /** 選んでいる物体の彩度の鍵。枠を置くと実測で入る */
+  colorKey: ColorKey | null;
+  /** 枠を置き終えているか（鍵が無い理由の出し分けに使う） */
+  hasRoi: boolean;
+  onUpdateColorKey: (key: ColorKey) => void;
   onResetData: () => void;
 }
 
@@ -30,6 +36,7 @@ const MARKER_MODES: { id: MarkerMode; label: string }[] = [
 
 export const TuneSheet: React.FC<Props> = ({
   tracking, onUpdateTracking, onResetData, guideOn, onChangeGuideOn,
+  colorKey, hasRoi, onUpdateColorKey,
 }) => {
   const [advanced, setAdvanced] = useState(false);
 
@@ -58,6 +65,7 @@ export const TuneSheet: React.FC<Props> = ({
           <div className="hint">
             サブピクセル補間 {tracking.subpixel ? 'ON' : 'OFF'} ／
             探索範囲 {tracking.searchScale.toFixed(1)}× ／
+            彩度で絞る {tracking.useColorKey ? (colorKey ? 'ON' : '測定なし') : 'OFF'} ／
             ロスト判定 {tracking.lostThreshold.toFixed(2)}
           </div>
         ) : (
@@ -119,6 +127,36 @@ export const TuneSheet: React.FC<Props> = ({
               onChange={v => onUpdateTracking({ ...tracking, searchScale: v })}
               hint="普段の窓は動きの変化から自動で決まります。ここはその上限（既定 1.0×）。目印を使っているなら小さいほうが有利です。広い窓は似た模様に乗り移る機会を増やすだけで、追跡の役には立ちません"
             />
+
+            <Switch
+              checked={tracking.useColorKey}
+              onChange={v => onUpdateTracking({ ...tracking, useColorKey: v })}
+              label="彩度で絞る"
+              hint={<>彩度が合わない画素を照合から外します。周囲の模様が消えるので、
+                似た明るさのものに乗り移りにくくなります。対象のほうが彩度が高いのか
+                低いのかは、枠を置いたときに実測して決めます。</>}
+            />
+
+            {tracking.useColorKey && (
+              colorKey ? (
+                <Slider
+                  label="彩度のしきい値"
+                  value={Math.round(colorKey.thr)}
+                  display={`${Math.round(colorKey.thr)}`}
+                  min={0} max={255} step={1}
+                  onChange={v => onUpdateColorKey({ ...colorKey, thr: v })}
+                  hint={`${describeKey(colorKey)}。暴れるときは、対象だけが残る側へ`
+                    + '寄せてください。動かすとテンプレートを作り直すので、'
+                    + 'やり直してから再生します'}
+                />
+              ) : (
+                <div className="hint">
+                  {hasRoi
+                    ? 'この枠では彩度で分けられませんでした。輝度だけで追跡しています。'
+                    : '枠を置くと、対象と周囲の彩度を測ります。'}
+                </div>
+              )
+            )}
 
             <Switch
               checked={tracking.stopOnExit}
