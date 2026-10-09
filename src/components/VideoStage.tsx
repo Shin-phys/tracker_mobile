@@ -23,6 +23,7 @@ import {
   TrackedObject, ScaleCalibration, Rect, Point, FrameData, FpsSettings, HaltInfo,
   SeedResult,
 } from '../types';
+import { originOf, sizeOf } from '../utils/restart';
 import { recalcScale, pixelDistance } from '../utils/calibration';
 import { applyHomography, invertHomography, Matrix3 } from '../utils/homography';
 import { MIN_ROI_SIZE, RECOMMENDED_ROI_SIZE } from '../utils/tracker';
@@ -577,10 +578,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (tool !== 'bridge') { setBridgeCount(0); return; }
     const v = videoRef.current;
     const o = objects.find(x => x.id === selectedObjId);
-    if (!v || !o || o.initialTime === null) return;
+    const org = o ? originOf(o) : null;
+    if (!v || !o || !org) return;
     v.pause();
     setIsPlaying(false);
-    const target = o.initialTime + 1 / Math.max(1, fpsRef.current.value);
+    const target = org.time + 1 / Math.max(1, fpsRef.current.value);
     seekToFrameTime(v, target).then(t => {
       frameTimeRef.current = t;
       setCurrentTime(t);
@@ -596,10 +598,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     if (tool !== 'seed') return;
     const v = videoRef.current;
     const o = objects.find(x => x.id === selectedObjId);
-    if (!v || !o || o.initialTime === null) return;
+    const org = o ? originOf(o) : null;
+    if (!v || !o || !org) return;
     v.pause();
     setIsPlaying(false);
-    const target = o.initialTime + SEED_FRAMES / Math.max(1, fpsRef.current.value);
+    const target = org.time + SEED_FRAMES / Math.max(1, fpsRef.current.value);
     seekToFrameTime(v, target).then(t => {
       frameTimeRef.current = t;
       setCurrentTime(t);
@@ -1212,7 +1215,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   /** 点検に使う枠の幅。ブレの限界の判定に効く */
   const checkRoiWidth = useMemo(() => {
     const o = objects.find(x => x.id === selectedObjId);
-    return o?.initialRoi?.width ?? o?.roi?.width ?? 0;
+    return (o ? sizeOf(o)?.width : 0) ?? 0;
   }, [objects, selectedObjId]);
 
   const trackQuality = useMemo(
@@ -1468,10 +1471,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
       if (!obj.active || !obj.seed || obj.id !== selectedObjId) return;
       ctx.save();
       ctx.globalAlpha = 0.75;
-      if (obj.initialRoi) {
+      const orgS = originOf(obj);
+      if (orgS) {
         const from = {
-          x: obj.initialRoi.x + obj.initialRoi.width / 2,
-          y: obj.initialRoi.y + obj.initialRoi.height / 2,
+          x: orgS.roi.x + orgS.roi.width / 2,
+          y: orgS.roi.y + orgS.roi.height / 2,
         };
         ctx.beginPath();
         ctx.moveTo(from.x, from.y);
@@ -1491,10 +1495,11 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     // 「1 コマあたりどれだけ動くか」を教えている、という意味が画で伝わる。
     if (tool === 'seed' && gesture?.kind === 'seed' && dragCurrent) {
       const o = objects.find(x => x.id === selectedObjId);
-      const from = o?.initialRoi
+      const org0 = o ? originOf(o) : null;
+      const from = org0
         ? {
-            x: o.initialRoi.x + o.initialRoi.width / 2,
-            y: o.initialRoi.y + o.initialRoi.height / 2,
+            x: org0.roi.x + org0.roi.width / 2,
+            y: org0.roi.y + org0.roi.height / 2,
           }
         : null;
       if (from) {
@@ -2620,7 +2625,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               onClick={() => {
                 const n = seedMsg.betterSize as number;
                 const o = objects.find(x => x.id === selectedObjId);
-                const base = o?.initialRoi ?? o?.roi;
+                const base = o ? sizeOf(o) : null;
                 setSeedMsg(null);
                 setRoiSize(n);
                 if (base) {
